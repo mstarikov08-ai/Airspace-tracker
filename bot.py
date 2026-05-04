@@ -2,8 +2,8 @@
 """
 Airspace NOTAM Tracker Bot
 Monitors global airspace closures and NOTAMs via Telegram.
-Data sources: aviationweather.gov SIGMETs, safeairspace.net,
-iranwarlive.com, skyrestrict-check.vercel.app
+Data sources: aviationweather.gov SIGMETs (VA only as closures),
+safeairspace.net, iranwarlive.com, skyrestrict-check.vercel.app
 """
 
 import os
@@ -18,6 +18,12 @@ from typing import Optional, List, Dict, Tuple, Any
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+
+try:
+    import cloudscraper as _cloudscraper_mod
+    _CLOUDSCRAPER_AVAILABLE = True
+except ImportError:
+    _CLOUDSCRAPER_AVAILABLE = False
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -31,6 +37,50 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+# Initialise cloudscraper after logger is ready so we can log the outcome
+if _CLOUDSCRAPER_AVAILABLE:
+    try:
+        import cloudscraper as _cloudscraper_mod
+        _cs = _cloudscraper_mod.create_scraper()
+        logger.info("cloudscraper loaded — will use as fallback for blocked sites")
+    except Exception as _exc:
+        _cs = None
+        logger.warning("cloudscraper init failed: %s", _exc)
+else:
+    _cs = None
+    logger.info("cloudscraper not installed — using plain requests for scrapers")
+
+SCRAPER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+
+def _fetch_url(url: str, timeout: int = 20) -> Optional["requests.Response"]:
+    """GET a URL with real-browser headers; fall back to cloudscraper if blocked."""
+    try:
+        r = requests.get(url, headers=SCRAPER_HEADERS, timeout=timeout)
+        logger.info("GET %s -> HTTP %d (%d bytes)", url, r.status_code, len(r.content))
+        logger.debug("Response preview: %s", r.text[:500])
+        if r.status_code in (403, 429, 503) and _cs is not None:
+            logger.info("Blocked (%d) — retrying with cloudscraper", r.status_code)
+            r = _cs.get(url, timeout=timeout)
+            logger.info("cloudscraper GET %s -> HTTP %d (%d bytes)", url, r.status_code, len(r.content))
+            logger.debug("cloudscraper preview: %s", r.text[:500])
+        return r
+    except Exception as exc:
+        logger.warning("_fetch_url %s failed: %s", url, exc)
+        return None
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURATION
@@ -151,6 +201,67 @@ for _region, _data in REGIONS.items():
 
 ALL_FIRS: List[str] = list(FIR_TO_REGION.keys())
 
+# FIR code -> human-readable FIR name
+FIR_READABLE: Dict[str, str] = {
+    "UUWW": "Moscow FIR",
+    "UURR": "Rostov FIR",
+    "ULLL": "St. Petersburg FIR",
+    "URWW": "Volgograd FIR",
+    "USSS": "Yekaterinburg FIR",
+    "UHHH": "Khabarovsk FIR",
+    "UNKL": "Krasnoyarsk FIR",
+    "UOOO": "Novosibirsk FIR",
+    "UKBV": "Kyiv FIR",
+    "UKOO": "Odesa FIR",
+    "UKHH": "Kharkiv FIR",
+    "UKFV": "Simferopol FIR",
+    "UKDV": "Dnipro FIR",
+    "UMMV": "Minsk FIR",
+    "LLLL": "Tel Aviv FIR",
+    "OIIX": "Tehran FIR",
+    "OIIG": "Tehran ACC",
+    "OIIS": "Shiraz FIR",
+    "OIAF": "Ahvaz FIR",
+    "ORBB": "Baghdad FIR",
+    "OLBA": "Beirut FIR",
+    "OSTT": "Damascus FIR",
+    "LUUU": "Chisinau FIR",
+    "UGGG": "Tbilisi FIR",
+    "UDDD": "Yerevan FIR",
+    "UBBA": "Baku FIR",
+    "LTAA": "Ankara FIR",
+    "LTBB": "Istanbul FIR",
+    "OJAC": "Amman FIR",
+    "OEJD": "Jeddah FIR",
+    "OERR": "Riyadh FIR",
+    "OYSC": "Sanaa FIR",
+    "HLLL": "Tripoli FIR",
+    "OAKX": "Kabul FIR",
+    "OPKR": "Karachi FIR",
+}
+
+# Display labels for scraped sources: source_key -> (group_label, emoji)
+SOURCE_DISPLAY: Dict[str, Tuple[str, str]] = {
+    "safeairspace": ("Conflict Zones (SafeAirspace)", "⚠️"),
+    "iranwarlive": ("Iran / Middle East (IranWarLive)", "\U0001f1ee\U0001f1f7"),
+    "skyrestrict": ("Global No-Fly Zones (SkyRestrict)", "\U0001f6ab"),
+}
+
+# SIGMET hazard code -> reason label (only VA is an actual airspace closure)
+SIGMET_HAZARD_REASON: Dict[str, str] = {
+    "VA": "\U0001f30b Volcanic Ash (airspace closure)",
+    "TS": "⛈️ Thunderstorm (weather advisory)",
+    "TURB": "\U0001f4a8 Turbulence (weather advisory)",
+    "SEV TURB": "\U0001f4a8 Severe Turbulence (weather advisory)",
+    "ICE": "\U0001f9ca Icing (weather advisory)",
+    "SEV ICE": "\U0001f9ca Severe Icing (weather advisory)",
+    "MTW": "\U0001f32a Mountain Wave (weather advisory)",
+    "DS": "\U0001f4a8 Dust Storm (weather advisory)",
+    "SS": "\U0001f4a8 Sand Storm (weather advisory)",
+    "RDOACT": "☢️ Radioactive Cloud",
+    "TC": "\U0001f300 Tropical Cyclone (weather advisory)",
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # DATABASE
 # ─────────────────────────────────────────────────────────────────────────────
@@ -169,6 +280,7 @@ def init_db() -> None:
                 location      TEXT NOT NULL,
                 region        TEXT,
                 source        TEXT,
+                notam_type    TEXT DEFAULT 'closure',
                 raw_text      TEXT,
                 description   TEXT,
                 altitude_lower TEXT,
@@ -193,11 +305,15 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_notams_valid_to  ON notams(valid_to);
             CREATE INDEX IF NOT EXISTS idx_notams_alerted   ON notams(alerted);
         """)
-        # Backfill `source` column for older DBs created before it existed.
-        try:
-            conn.execute("ALTER TABLE notams ADD COLUMN source TEXT")
-        except sqlite3.OperationalError:
-            pass  # column already exists
+        # Backfill columns for older DBs created before these columns existed.
+        for col_def in [
+            "source TEXT",
+            "notam_type TEXT DEFAULT 'closure'",
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE notams ADD COLUMN {col_def}")
+            except sqlite3.OperationalError:
+                pass
     logger.info("Database ready at %s", DB_PATH)
 
 
@@ -208,9 +324,8 @@ def init_db() -> None:
 def fetch_notams(icao_codes: List[str]) -> List[Any]:
     """Fetch SIGMETs from aviationweather.gov.
 
-    The legacy `/api/data/notam` endpoint was retired by NOAA, so we now use
-    the international SIGMET endpoint, which returns hazardous-airspace
-    advisories worldwide (volcanic ash, severe turbulence, etc.).
+    Only VA (volcanic ash) SIGMETs represent actual airspace closures.
+    TS/TURB/ICE SIGMETs are weather advisories stored separately for /weather.
     """
     try:
         resp = requests.get(
@@ -271,7 +386,7 @@ def extract_raw_fields(raw: str) -> Dict[str, str]:
             f["fir"] = parts[0].strip()
             f["qcode"] = parts[1].strip()
             f["q_lower"] = parts[5].strip()
-            f["q_upper"] = parts[6].strip().split()[0]  # strip trailing coords
+            f["q_upper"] = parts[6].strip().split()[0]
 
     m = re.search(r"A\)\s*([A-Z0-9]{4})", raw)
     if m:
@@ -318,9 +433,10 @@ def classify_reason(
         "restricted area", "danger area", "prohibited area", "weapons",
         "exercise", "nato", "combat", "hostile", "missile", "artillery",
         "drone", "uav", "uas", "wartime", "tsa", "tra", "moa", "firing",
+        "no-fly", "no fly", "conflict", "war", "fighting", "troops",
     ]
     if any(kw in text for kw in military_kw):
-        return "Military activity"
+        return "Military / Conflict activity"
 
     vip_kw = [
         "vip", "head of state", "state aircraft", "royal flight",
@@ -329,7 +445,7 @@ def classify_reason(
     if any(kw in text for kw in vip_kw):
         return "VIP movement"
 
-    # Short-duration closure near known VIP capitals → likely VIP
+    # Short-duration closure near known VIP capitals -> likely VIP
     vip_firs = {"UUWW", "UURR", "LLLL", "LTBA", "LTAC", "EIDW", "EGLL"}
     if hours is not None and hours <= 3 and location in vip_firs:
         return "VIP movement (suspected)"
@@ -346,12 +462,11 @@ def classify_reason(
     weather_kw = [
         "weather", "wind shear", "severe turbulence", "icing",
         "thunderstorm", "ash cloud", "volcanic ash", "fog", "blizzard",
-        "sigmet",
     ]
     if any(kw in text for kw in weather_kw):
         return "Weather-related"
 
-    # Known active conflict FIRs → assume military
+    # Known active conflict FIRs -> assume military
     conflict_firs = {
         "UKBV", "UKHH", "UKOO", "UKFV", "UKDV",
         "OSTT", "ORBB", "OYSC", "HLLL", "OAKX",
@@ -386,7 +501,7 @@ def detect_severity(lower: str, upper: str) -> Tuple[str, str]:
     if lo == 0 and hi >= 600:
         return "Full airspace closure", "⛔"
     if lo == 0 and hi >= 200:
-        return "Major closure (surface–high alt)", "\U0001f534"
+        return "Major closure (surface-high alt)", "\U0001f534"
     if lo == 0:
         return "Low-level closure", "\U0001f7e0"
     if hi >= 600:
@@ -422,6 +537,14 @@ def he(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def location_display(loc: str) -> str:
+    """Return human-readable location string with FIR name if known."""
+    readable = FIR_READABLE.get(loc)
+    if readable:
+        return f"{readable} ({loc})"
+    return loc
+
+
 def format_alert(notam: sqlite3.Row) -> str:
     """Render a NOTAM database row as a formatted HTML Telegram message."""
     region = notam["region"] or "Unknown"
@@ -443,9 +566,12 @@ def format_alert(notam: sqlite3.Row) -> str:
     except (IndexError, KeyError):
         pass
 
+    loc = notam["location"]
+    loc_str = location_display(loc)
+
     return (
         f"{sev_emoji} <b>AIRSPACE CLOSURE — {he(region)} {flag}</b>\n"
-        f"\U0001f4cd <b>Location:</b> <code>{he(notam['location'])}</code>\n"
+        f"\U0001f4cd <b>Location:</b> <code>{he(loc_str)}</code>\n"
         f"⛔ <b>Altitude:</b> {he(fmt_alt(notam['altitude_lower'], notam['altitude_upper']))} — {he(sev_label)}\n"
         f"⏰ <b>Valid:</b> {he(fmt_dt(vf))} → {he(fmt_dt(vt))}{he(fmt_duration(vf, vt))}\n"
         f"\n"
@@ -463,6 +589,8 @@ def process_item(item: Any, fallback_location: str, source: str = "aviationweath
     notam_id = ""
     location = fallback_location
     start_raw = end_raw = description = alt_lower = alt_upper = ""
+    notam_type = "closure"
+    sigmet_hazard = ""
 
     if isinstance(item, dict) and "properties" in item:
         # GeoJSON feature (legacy NOTAM API)
@@ -477,6 +605,9 @@ def process_item(item: Any, fallback_location: str, source: str = "aviationweath
         alt_upper = str(props.get("highestAlt") or "")
     elif isinstance(item, dict) and "hazard" in item:
         # SIGMET row from the international SIGMET endpoint
+        sigmet_hazard = item.get("hazard", "").upper().strip()
+        # Only VA (volcanic ash) SIGMETs are real airspace closures
+        notam_type = "closure" if sigmet_hazard == "VA" else "sigmet_weather"
         notam_id = f"sigmet:{item.get('icaoId','')}:{item.get('seriesId','')}:{item.get('validTimeFrom','')}"
         location = str(item.get("firId") or item.get("icaoId") or fallback_location)
         start_raw = str(item.get("validTimeFrom") or "")
@@ -518,18 +649,25 @@ def process_item(item: Any, fallback_location: str, source: str = "aviationweath
     vt = parse_time(end_raw)
     region = FIR_TO_REGION.get(location) or FIR_TO_REGION.get(fallback_location)
 
+    # Determine reason: use SIGMET hazard code directly; fallback to keyword matching
+    if sigmet_hazard:
+        reason = SIGMET_HAZARD_REASON.get(sigmet_hazard, f"SIGMET: {sigmet_hazard}")
+    else:
+        reason = classify_reason(description, location, vf, vt)
+
     return {
         "notam_id": notam_id,
         "location": location or fallback_location,
         "region": region,
         "source": source,
+        "notam_type": notam_type,
         "raw_text": raw_text[:2000],
         "description": description[:600],
         "altitude_lower": alt_lower[:50],
         "altitude_upper": alt_upper[:50],
         "valid_from": vf.isoformat() if vf else "",
         "valid_to": vt.isoformat() if vt else "",
-        "reason": classify_reason(description, location, vf, vt),
+        "reason": reason,
         "severity": detect_severity(alt_lower, alt_upper)[0],
         "first_seen": datetime.now(timezone.utc).isoformat(),
     }
@@ -549,13 +687,14 @@ def save_notam(n: Dict) -> bool:
         conn.execute(
             """
             INSERT INTO notams
-                (notam_id, location, region, source, raw_text, description,
+                (notam_id, location, region, source, notam_type, raw_text, description,
                  altitude_lower, altitude_upper, valid_from, valid_to,
                  reason, severity, alerted, first_seen)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0,?)
             """,
             (
                 n["notam_id"], n["location"], n["region"], n.get("source", ""),
+                n.get("notam_type", "closure"),
                 n["raw_text"], n["description"],
                 n["altitude_lower"], n["altitude_upper"],
                 n["valid_from"], n["valid_to"],
@@ -566,11 +705,7 @@ def save_notam(n: Dict) -> bool:
 
 
 def save_scraper_text(source: str, text: str) -> bool:
-    """Persist raw scraped text from a non-API source as a NOTAM row.
-
-    Each entry is keyed by hash(source + text) so the same content from
-    a given site does not produce duplicate alerts.
-    """
+    """Persist raw scraped text from a non-API source as a NOTAM row."""
     text = (text or "").strip()
     if not text:
         return False
@@ -584,13 +719,14 @@ def save_scraper_text(source: str, text: str) -> bool:
         conn.execute(
             """
             INSERT INTO notams
-                (notam_id, location, region, source, raw_text, description,
+                (notam_id, location, region, source, notam_type, raw_text, description,
                  altitude_lower, altitude_upper, valid_from, valid_to,
                  reason, severity, alerted, first_seen)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0,?)
             """,
             (
                 notam_id, source.upper(), None, source,
+                "closure",
                 text[:8000], text[:600],
                 "", "", "", "",
                 classify_reason(text, "", None, None),
@@ -606,22 +742,36 @@ def get_active_notams(
     location: Optional[str] = None,
     limit: int = 50,
 ) -> List[sqlite3.Row]:
+    """Return active closure NOTAMs, excluding SIGMET weather advisories."""
     now = datetime.now(timezone.utc).isoformat()
+    weather_filter = "AND (notam_type IS NULL OR notam_type != 'sigmet_weather')"
     with get_db() as conn:
         if region:
             return conn.execute(
-                "SELECT * FROM notams WHERE region = ? AND (valid_to = '' OR valid_to > ?) "
-                "ORDER BY first_seen DESC LIMIT ?",
+                f"SELECT * FROM notams WHERE region = ? AND (valid_to = '' OR valid_to > ?) "
+                f"{weather_filter} ORDER BY first_seen DESC LIMIT ?",
                 (region, now, limit),
             ).fetchall()
         if location:
             return conn.execute(
-                "SELECT * FROM notams WHERE location = ? AND (valid_to = '' OR valid_to > ?) "
-                "ORDER BY first_seen DESC LIMIT ?",
+                f"SELECT * FROM notams WHERE location = ? AND (valid_to = '' OR valid_to > ?) "
+                f"{weather_filter} ORDER BY first_seen DESC LIMIT ?",
                 (location, now, limit),
             ).fetchall()
         return conn.execute(
-            "SELECT * FROM notams WHERE valid_to = '' OR valid_to > ? "
+            f"SELECT * FROM notams WHERE (valid_to = '' OR valid_to > ?) "
+            f"{weather_filter} ORDER BY first_seen DESC LIMIT ?",
+            (now, limit),
+        ).fetchall()
+
+
+def get_weather_sigmets(limit: int = 100) -> List[sqlite3.Row]:
+    """Return active SIGMET weather advisories (TS/TURB/ICE etc.)."""
+    now = datetime.now(timezone.utc).isoformat()
+    with get_db() as conn:
+        return conn.execute(
+            "SELECT * FROM notams WHERE notam_type = 'sigmet_weather' "
+            "AND (valid_to = '' OR valid_to > ?) "
             "ORDER BY first_seen DESC LIMIT ?",
             (now, limit),
         ).fetchall()
@@ -688,59 +838,74 @@ def get_user_subscriptions(chat_id: int) -> List[str]:
 
 def scrape_safeairspace() -> int:
     """Scrape safeairspace.net for current conflict-zone advisories."""
-    try:
-        r = requests.get(
-            "https://safeairspace.net/",
-            headers={"User-Agent": "AirspaceBot/1.0"},
-            timeout=10,
-        )
-        soup = BeautifulSoup(r.text, "html.parser")
+    url = "https://safeairspace.net/"
+    r = _fetch_url(url)
+    if r is None:
+        logger.warning("safeairspace: no response")
+        return 0
+    if r.status_code != 200:
+        logger.warning("safeairspace: HTTP %d -- skipping", r.status_code)
+        logger.info("safeairspace response preview: %s", r.text[:500])
+        return 0
+    soup = BeautifulSoup(r.text, "html.parser")
+    content_tags = soup.find_all(["article", "section", "div"], class_=re.compile(r"(country|risk|advisory|warning|item|content)", re.I))
+    if content_tags:
+        text = "\n".join(t.get_text(separator=" ", strip=True) for t in content_tags)
+    else:
         text = soup.get_text(separator="\n", strip=True)
-        if save_scraper_text("safeairspace", text):
-            logger.info("safeairspace: stored new advisory snapshot")
-            return 1
-        return 0
-    except Exception as exc:
-        logger.warning("safeairspace scrape failed: %s", exc)
-        return 0
+    logger.info("safeairspace: extracted %d chars of text", len(text))
+    logger.info("safeairspace text preview: %s", text[:500])
+    saved = save_scraper_text("safeairspace", text)
+    logger.info("safeairspace: %s", "stored new snapshot" if saved else "no change (duplicate)")
+    return 1 if saved else 0
 
 
 def scrape_iranwarlive() -> int:
     """Scrape iranwarlive.com/airspace for Iranian airspace updates."""
-    try:
-        r = requests.get(
-            "https://iranwarlive.com/airspace",
-            headers={"User-Agent": "AirspaceBot/1.0"},
-            timeout=10,
-        )
-        soup = BeautifulSoup(r.text, "html.parser")
+    url = "https://iranwarlive.com/airspace"
+    r = _fetch_url(url)
+    if r is None:
+        logger.warning("iranwarlive: no response")
+        return 0
+    if r.status_code != 200:
+        logger.warning("iranwarlive: HTTP %d -- skipping", r.status_code)
+        logger.info("iranwarlive response preview: %s", r.text[:500])
+        return 0
+    soup = BeautifulSoup(r.text, "html.parser")
+    content_tags = soup.find_all(["article", "section", "p", "div"], class_=re.compile(r"(post|entry|content|article|news|update)", re.I))
+    if content_tags:
+        text = "\n".join(t.get_text(separator=" ", strip=True) for t in content_tags)
+    else:
         text = soup.get_text(separator="\n", strip=True)
-        if save_scraper_text("iranwarlive", text):
-            logger.info("iranwarlive: stored new advisory snapshot")
-            return 1
-        return 0
-    except Exception as exc:
-        logger.warning("iranwarlive scrape failed: %s", exc)
-        return 0
+    logger.info("iranwarlive: extracted %d chars of text", len(text))
+    logger.info("iranwarlive text preview: %s", text[:500])
+    saved = save_scraper_text("iranwarlive", text)
+    logger.info("iranwarlive: %s", "stored new snapshot" if saved else "no change (duplicate)")
+    return 1 if saved else 0
 
 
 def scrape_skyrestrict() -> int:
     """Scrape skyrestrict-check.vercel.app for global airspace restrictions."""
-    try:
-        r = requests.get(
-            "https://skyrestrict-check.vercel.app/en",
-            headers={"User-Agent": "AirspaceBot/1.0"},
-            timeout=10,
-        )
-        soup = BeautifulSoup(r.text, "html.parser")
+    url = "https://skyrestrict-check.vercel.app/en"
+    r = _fetch_url(url)
+    if r is None:
+        logger.warning("skyrestrict: no response")
+        return 0
+    if r.status_code != 200:
+        logger.warning("skyrestrict: HTTP %d -- skipping", r.status_code)
+        logger.info("skyrestrict response preview: %s", r.text[:500])
+        return 0
+    soup = BeautifulSoup(r.text, "html.parser")
+    content_tags = soup.find_all(["table", "tr", "li", "div", "section"], class_=re.compile(r"(country|zone|restrict|closure|item|row|entry)", re.I))
+    if content_tags:
+        text = "\n".join(t.get_text(separator=" ", strip=True) for t in content_tags)
+    else:
         text = soup.get_text(separator="\n", strip=True)
-        if save_scraper_text("skyrestrict", text):
-            logger.info("skyrestrict: stored new advisory snapshot")
-            return 1
-        return 0
-    except Exception as exc:
-        logger.warning("skyrestrict scrape failed: %s", exc)
-        return 0
+    logger.info("skyrestrict: extracted %d chars of text", len(text))
+    logger.info("skyrestrict text preview: %s", text[:500])
+    saved = save_scraper_text("skyrestrict", text)
+    logger.info("skyrestrict: %s", "stored new snapshot" if saved else "no change (duplicate)")
+    return 1 if saved else 0
 
 
 async def run_scrapers(app: Application) -> None:
@@ -750,7 +915,7 @@ async def run_scrapers(app: Application) -> None:
     new_total += scrape_safeairspace()
     new_total += scrape_iranwarlive()
     new_total += scrape_skyrestrict()
-    logger.info("Scraper cycle complete — %d new entries", new_total)
+    logger.info("Scraper cycle complete -- %d new entries", new_total)
     await dispatch_unalerted(app)
 
 
@@ -764,6 +929,14 @@ async def dispatch_unalerted(app: Application) -> None:
         return
     logger.info("Dispatching alerts for %d entries", len(unalerted))
     for notam in unalerted:
+        # Skip weather-only SIGMETs from channel/subscriber alerts
+        try:
+            if notam["notam_type"] == "sigmet_weather":
+                mark_alerted(notam["notam_id"])
+                continue
+        except (IndexError, KeyError):
+            pass
+
         text = format_alert(notam)
         region = notam["region"]
 
@@ -797,7 +970,7 @@ async def poll_and_alert(app: Application) -> None:
         n = process_item(item, ALL_FIRS[0] if ALL_FIRS else "", source="aviationweather.gov")
         if n and save_notam(n):
             new_total += 1
-    logger.info("SIGMET poll complete — %d new", new_total)
+    logger.info("SIGMET poll complete -- %d new", new_total)
     await dispatch_unalerted(app)
 
 
@@ -830,6 +1003,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• /region Russia — active Russian closures\n"
         "• /subscribe Ukraine — live alerts for Ukraine\n"
         "• /active — all active closures worldwide\n"
+        "• /weather — active SIGMET weather advisories\n"
         "• /help — full command reference\n\n"
         "Sources: aviationweather.gov SIGMETs, safeairspace.net, iranwarlive.com, skyrestrict-check.vercel.app."
     )
@@ -847,7 +1021,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/region &lt;name&gt; — Active closures for a region\n"
         "  <i>Example: /region Russia</i>\n"
         "/regions — List all monitored regions\n"
-        "/active — All currently active worldwide closures\n\n"
+        "/active — All currently active worldwide <b>closures</b>\n"
+        "/weather — Active SIGMET weather advisories (not closures)\n\n"
         "<b>Alerts:</b>\n"
         "/subscribe &lt;region&gt; — Auto-alerts for a region\n"
         "  <i>Example: /subscribe Ukraine</i>\n"
@@ -879,7 +1054,6 @@ async def cmd_notam(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         parse_mode=ParseMode.HTML,
     )
 
-    # Live fetch then return from DB
     items = fetch_notams([icao])
     for item in items:
         n = process_item(item, icao, source="aviationweather.gov")
@@ -890,13 +1064,14 @@ async def cmd_notam(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if not notams:
         await update.message.reply_text(
-            f"✅ No active NOTAMs/SIGMETs found for <code>{he(icao)}</code>.",
+            f"✅ No active closures found for <code>{he(icao)}</code>.\n"
+            f"Use /weather to check SIGMET weather advisories.",
             parse_mode=ParseMode.HTML,
         )
         return
 
     await update.message.reply_text(
-        f"Found <b>{len(notams)}</b> active entry(ies) for <code>{he(icao)}</code>:",
+        f"Found <b>{len(notams)}</b> active closure(s) for <code>{he(icao)}</code>:",
         parse_mode=ParseMode.HTML,
     )
     for notam in notams[:5]:
@@ -1019,31 +1194,56 @@ async def cmd_active(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not notams:
         await update.message.reply_text(
             "✅ No active airspace closures in the database yet.\n\n"
-            "Sources refresh every 15–30 minutes. Use /notam &lt;ICAO&gt; for a live query.",
+            "Sources refresh every 15–30 minutes. Use /notam &lt;ICAO&gt; for a live query.\n"
+            "Use /weather for SIGMET weather advisories.",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    by_region: Dict[str, list] = {}
+    # Group by region; scraped entries (region=None) grouped by source label
+    by_group: Dict[str, list] = {}
     for n in notams:
-        by_region.setdefault(n["region"] or "Other", []).append(n)
+        region = n["region"]
+        if region:
+            group_key = region
+        else:
+            src = (n["source"] or "unknown").lower()
+            label, _ = SOURCE_DISPLAY.get(src, (f"Other ({src})", "\U0001f30d"))
+            group_key = label
+        by_group.setdefault(group_key, []).append(n)
 
-    def _priority(r: str) -> int:
-        p = REGIONS.get(r, {}).get("priority", "low")
+    def _priority(key: str) -> int:
+        p = REGIONS.get(key, {}).get("priority", "low")
         return {"high": 0, "medium": 1, "low": 2}.get(p, 3)
 
-    sorted_regions = sorted(by_region, key=lambda r: (_priority(r), r))
+    sorted_groups = sorted(by_group, key=lambda k: (_priority(k), k))
 
     lines = [f"\U0001f30d <b>Active Airspace Closures</b> ({len(notams)} total)\n"]
-    for region in sorted_regions[:20]:
-        rnots = by_region[region]
-        flag = REGIONS.get(region, {}).get("flag", "\U0001f30d")
+    for group in sorted_groups[:25]:
+        items = by_group[group]
+        n0 = items[0]
+
+        # Determine flag emoji
+        if group in REGIONS:
+            flag = REGIONS[group]["flag"]
+        else:
+            src = (n0["source"] or "").lower()
+            _, flag = SOURCE_DISPLAY.get(src, ("\U0001f30d", "\U0001f30d"))
+
         _, sev_emoji = detect_severity(
-            rnots[0]["altitude_lower"] or "", rnots[0]["altitude_upper"] or ""
+            n0["altitude_lower"] or "", n0["altitude_upper"] or ""
         )
-        reason = rnots[0]["reason"] or "Unknown"
+        reason = n0["reason"] or "Unknown"
+
+        # Show readable FIR name if the group is a known region
+        if group in REGIONS and n0["location"]:
+            loc_str = location_display(n0["location"])
+            loc_hint = f" — {he(loc_str)}" if loc_str != group else ""
+        else:
+            loc_hint = ""
+
         lines.append(
-            f"{sev_emoji} {flag} <b>{he(region)}</b> — {len(rnots)} entry(ies)"
+            f"{sev_emoji} {flag} <b>{he(group)}</b>{loc_hint} — {len(items)} entry(ies)"
         )
         lines.append(f"   └ {he(reason)}")
 
@@ -1054,13 +1254,54 @@ async def cmd_active(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 
+async def cmd_weather(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show active SIGMET weather advisories (not airspace closures)."""
+    notams = get_weather_sigmets(limit=100)
+
+    if not notams:
+        await update.message.reply_text(
+            "✅ No active SIGMET weather advisories at this time.\n\n"
+            "Use /active to see airspace closures.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # Group by hazard type extracted from description
+    by_hazard: Dict[str, list] = {}
+    for n in notams:
+        desc = (n["description"] or "").strip()
+        hazard_code = desc.split()[0].upper() if desc else "OTHER"
+        label = SIGMET_HAZARD_REASON.get(hazard_code, f"⚠️ SIGMET: {hazard_code}")
+        by_hazard.setdefault(label, []).append(n)
+
+    lines = [f"⛅ <b>Active SIGMET Weather Advisories</b> ({len(notams)} total)\n"]
+    for label in sorted(by_hazard):
+        items = by_hazard[label]
+        lines.append(f"<b>{he(label)}</b> — {len(items)} advisory(ies)")
+        for n in items[:5]:
+            loc = n["location"]
+            region = n["region"] or ""
+            flag = REGIONS.get(region, {}).get("flag", "")
+            loc_str = location_display(loc)
+            lines.append(f"   • {flag} {he(loc_str)}")
+        lines.append("")
+
+    lines.append("<i>SIGMETs are weather advisories, not airspace closures.\nOnly volcanic ash (VA) SIGMETs restrict airspace.</i>")
+
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
 async def cmd_regions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     by_priority: Dict[str, list] = {"high": [], "medium": [], "low": []}
     for region, data in REGIONS.items():
         by_priority[data["priority"]].append((region, data))
 
     lines = ["\U0001f5fa️ <b>Monitored Regions</b>\n"]
-    labels = [("high", "\U0001f534 High Priority"), ("medium", "\U0001f7e1 Medium Priority"), ("low", "\U0001f535 Low Priority")]
+    labels = [
+        ("high", "\U0001f534 High Priority"),
+        ("medium", "\U0001f7e1 Medium Priority"),
+        ("low", "\U0001f535 Low Priority"),
+    ]
     for key, label in labels:
         lines.append(f"<b>{label}:</b>")
         for region, data in sorted(by_priority[key]):
@@ -1095,7 +1336,6 @@ async def cmd_map(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def _post_init(app: Application) -> None:
     scheduler = AsyncIOScheduler(timezone="UTC")
 
-    # SIGMET feed every POLL_INTERVAL minutes (default 15)
     scheduler.add_job(
         poll_and_alert,
         trigger="interval",
@@ -1107,7 +1347,6 @@ async def _post_init(app: Application) -> None:
         coalesce=True,
     )
 
-    # Web scrapers every SCRAPE_INTERVAL minutes (default 30)
     scheduler.add_job(
         run_scrapers,
         trigger="interval",
@@ -1122,7 +1361,7 @@ async def _post_init(app: Application) -> None:
     scheduler.start()
     app.bot_data["scheduler"] = scheduler
     logger.info(
-        "Scheduler started — SIGMETs every %d min, scrapers every %d min",
+        "Scheduler started -- SIGMETs every %d min, scrapers every %d min",
         POLL_INTERVAL, SCRAPE_INTERVAL,
     )
 
@@ -1159,12 +1398,13 @@ def main() -> None:
         ("subscribe", cmd_subscribe),
         ("unsubscribe", cmd_unsubscribe),
         ("active", cmd_active),
+        ("weather", cmd_weather),
         ("map", cmd_map),
     ]:
         app.add_handler(CommandHandler(cmd, handler))
 
     logger.info(
-        "Bot starting up — %d regions, %d FIRs monitored",
+        "Bot starting up -- %d regions, %d FIRs monitored",
         len(REGIONS), len(ALL_FIRS),
     )
     app.run_polling(allowed_updates=Update.ALL_TYPES)
