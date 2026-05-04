@@ -2,7 +2,8 @@
 """
 Airspace NOTAM Tracker Bot
 Monitors global airspace closures and NOTAMs via Telegram.
-Data source: aviationweather.gov (free, no API key required)
+Data sources: aviationweather.gov SIGMETs, safeairspace.net,
+iranwarlive.com, skyrestrict-check.vercel.app
 """
 
 import os
@@ -15,6 +16,7 @@ from datetime import datetime, timezone
 from typing import Optional, List, Dict, Tuple, Any
 
 import requests
+from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Update
@@ -38,8 +40,9 @@ BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHANNEL_ID: str = os.getenv("TELEGRAM_CHANNEL_ID", "")
 DB_PATH: str = os.getenv("DB_PATH", "notams.db")
 POLL_INTERVAL: int = int(os.getenv("POLL_INTERVAL_MINUTES", "15"))
+SCRAPE_INTERVAL: int = int(os.getenv("SCRAPE_INTERVAL_MINUTES", "30"))
 
-AVIATIONWEATHER_API = "https://aviationweather.gov/api/data/notam"
+AVIATIONWEATHER_API = "https://aviationweather.gov/api/data/isigmet?format=json"
 
 # Regions with FIR codes, emoji flags, and priority level
 REGIONS: Dict[str, Dict] = {
@@ -165,6 +168,7 @@ def init_db() -> None:
                 notam_id      TEXT PRIMARY KEY,
                 location      TEXT NOT NULL,
                 region        TEXT,
+                source        TEXT,
                 raw_text      TEXT,
                 description   TEXT,
                 altitude_lower TEXT,
@@ -185,24 +189,34 @@ def init_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_notams_location  ON notams(location);
             CREATE INDEX IF NOT EXISTS idx_notams_region    ON notams(region);
+            CREATE INDEX IF NOT EXISTS idx_notams_source    ON notams(source);
             CREATE INDEX IF NOT EXISTS idx_notams_valid_to  ON notams(valid_to);
             CREATE INDEX IF NOT EXISTS idx_notams_alerted   ON notams(alerted);
         """)
+        # Backfill `source` column for older DBs created before it existed.
+        try:
+            conn.execute("ALTER TABLE notams ADD COLUMN source TEXT")
+        except sqlite3.OperationalError:
+            pass  # column already exists
     logger.info("Database ready at %s", DB_PATH)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# NOTAM FETCHING & PARSING
+# NOTAM/SIGMET FETCHING & PARSING
 # ─────────────────────────────────────────────────────────────────────────────
 
 def fetch_notams(icao_codes: List[str]) -> List[Any]:
-    """Fetch NOTAMs from aviationweather.gov for a space-separated list of ICAO codes."""
+    """Fetch SIGMETs from aviationweather.gov.
+
+    The legacy `/api/data/notam` endpoint was retired by NOAA, so we now use
+    the international SIGMET endpoint, which returns hazardous-airspace
+    advisories worldwide (volcanic ash, severe turbulence, etc.).
+    """
     try:
         resp = requests.get(
             AVIATIONWEATHER_API,
-            params={"format": "json", "location": " ".join(icao_codes)},
             timeout=30,
-            headers={"User-Agent": "AirspaceTrackerBot/1.0 (github.com/airspace-tracker)"},
+            headers={"User-Agent": "AirspaceBot/1.0"},
         )
         resp.raise_for_status()
         data = resp.json()
@@ -212,10 +226,10 @@ def fetch_notams(icao_codes: List[str]) -> List[Any]:
             return data.get("features", [])
         return []
     except requests.RequestException as exc:
-        logger.warning("NOTAM fetch failed for %s: %s", icao_codes, exc)
+        logger.warning("SIGMET fetch failed: %s", exc)
         return []
     except (json.JSONDecodeError, ValueError) as exc:
-        logger.warning("NOTAM parse error for %s: %s", icao_codes, exc)
+        logger.warning("SIGMET parse error: %s", exc)
         return []
 
 
@@ -235,6 +249,13 @@ def parse_time(raw: Optional[str]) -> Optional[datetime]:
             return datetime.strptime(raw, fmt).replace(tzinfo=timezone.utc)
         except ValueError:
             pass
+    # Unix epoch seconds (used by the SIGMET API)
+    try:
+        ts = int(raw)
+        if ts > 10_000_000:
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
+    except ValueError:
+        pass
     return None
 
 
@@ -415,20 +436,28 @@ def format_alert(notam: sqlite3.Row) -> str:
     if len(raw) > 600:
         raw = raw[:600] + "…"
 
+    source_line = ""
+    try:
+        if notam["source"]:
+            source_line = f"\n\U0001f517 <b>Source:</b> {he(notam['source'])}"
+    except (IndexError, KeyError):
+        pass
+
     return (
         f"{sev_emoji} <b>AIRSPACE CLOSURE — {he(region)} {flag}</b>\n"
         f"\U0001f4cd <b>Location:</b> <code>{he(notam['location'])}</code>\n"
         f"⛔ <b>Altitude:</b> {he(fmt_alt(notam['altitude_lower'], notam['altitude_upper']))} — {he(sev_label)}\n"
         f"⏰ <b>Valid:</b> {he(fmt_dt(vf))} → {he(fmt_dt(vt))}{he(fmt_duration(vf, vt))}\n"
         f"\n"
-        f"\U0001f4cb <b>Raw NOTAM:</b>\n"
+        f"\U0001f4cb <b>Raw:</b>\n"
         f"<pre>{he(raw)}</pre>\n"
         f"\n"
         f"\U0001f4a1 <b>Likely reason:</b> {he(notam['reason'] or 'Unknown')}"
+        f"{source_line}"
     )
 
 
-def process_item(item: Any, fallback_location: str) -> Optional[Dict]:
+def process_item(item: Any, fallback_location: str, source: str = "aviationweather.gov") -> Optional[Dict]:
     """Convert a single API response item into a normalised dict."""
     raw_text = ""
     notam_id = ""
@@ -436,6 +465,7 @@ def process_item(item: Any, fallback_location: str) -> Optional[Dict]:
     start_raw = end_raw = description = alt_lower = alt_upper = ""
 
     if isinstance(item, dict) and "properties" in item:
+        # GeoJSON feature (legacy NOTAM API)
         props = item["properties"]
         raw_text = props.get("all", "") or props.get("message", "") or ""
         notam_id = str(props.get("id") or props.get("notamId") or "")
@@ -445,13 +475,28 @@ def process_item(item: Any, fallback_location: str) -> Optional[Dict]:
         description = str(props.get("text") or props.get("message") or "")
         alt_lower = str(props.get("lowestAlt") or "")
         alt_upper = str(props.get("highestAlt") or "")
+    elif isinstance(item, dict) and "hazard" in item:
+        # SIGMET row from the international SIGMET endpoint
+        notam_id = f"sigmet:{item.get('icaoId','')}:{item.get('seriesId','')}:{item.get('validTimeFrom','')}"
+        location = str(item.get("firId") or item.get("icaoId") or fallback_location)
+        start_raw = str(item.get("validTimeFrom") or "")
+        end_raw = str(item.get("validTimeTo") or "")
+        description = (
+            f"{item.get('hazard','')} {item.get('qualifier','')} "
+            f"{item.get('firName','')} (SIGMET)"
+        ).strip()
+        raw_text = item.get("rawSigmet") or item.get("raw") or json.dumps(item)[:400]
+        base = item.get("base")
+        top = item.get("top")
+        alt_lower = str(base) if base else ""
+        alt_upper = str(top) if top else ""
     elif isinstance(item, str):
         raw_text = item
     else:
         return None
 
     # Supplement from raw NOTAM text when fields are missing
-    if raw_text:
+    if raw_text and not isinstance(item, dict) or (isinstance(item, dict) and "properties" in item):
         rf = extract_raw_fields(raw_text)
         location = location or rf.get("location", fallback_location)
         start_raw = start_raw or rf.get("start", "")
@@ -477,6 +522,7 @@ def process_item(item: Any, fallback_location: str) -> Optional[Dict]:
         "notam_id": notam_id,
         "location": location or fallback_location,
         "region": region,
+        "source": source,
         "raw_text": raw_text[:2000],
         "description": description[:600],
         "altitude_lower": alt_lower[:50],
@@ -503,17 +549,53 @@ def save_notam(n: Dict) -> bool:
         conn.execute(
             """
             INSERT INTO notams
-                (notam_id, location, region, raw_text, description,
+                (notam_id, location, region, source, raw_text, description,
                  altitude_lower, altitude_upper, valid_from, valid_to,
                  reason, severity, alerted, first_seen)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,0,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0,?)
             """,
             (
-                n["notam_id"], n["location"], n["region"],
+                n["notam_id"], n["location"], n["region"], n.get("source", ""),
                 n["raw_text"], n["description"],
                 n["altitude_lower"], n["altitude_upper"],
                 n["valid_from"], n["valid_to"],
                 n["reason"], n["severity"], n["first_seen"],
+            ),
+        )
+        return True
+
+
+def save_scraper_text(source: str, text: str) -> bool:
+    """Persist raw scraped text from a non-API source as a NOTAM row.
+
+    Each entry is keyed by hash(source + text) so the same content from
+    a given site does not produce duplicate alerts.
+    """
+    text = (text or "").strip()
+    if not text:
+        return False
+    digest = hashlib.sha256(f"{source}|{text}".encode()).hexdigest()[:24]
+    notam_id = f"{source}:{digest}"
+    with get_db() as conn:
+        if conn.execute(
+            "SELECT 1 FROM notams WHERE notam_id = ?", (notam_id,)
+        ).fetchone():
+            return False
+        conn.execute(
+            """
+            INSERT INTO notams
+                (notam_id, location, region, source, raw_text, description,
+                 altitude_lower, altitude_upper, valid_from, valid_to,
+                 reason, severity, alerted, first_seen)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0,?)
+            """,
+            (
+                notam_id, source.upper(), None, source,
+                text[:8000], text[:600],
+                "", "", "", "",
+                classify_reason(text, "", None, None),
+                "Reported (scraped)",
+                datetime.now(timezone.utc).isoformat(),
             ),
         )
         return True
@@ -529,18 +611,18 @@ def get_active_notams(
         if region:
             return conn.execute(
                 "SELECT * FROM notams WHERE region = ? AND (valid_to = '' OR valid_to > ?) "
-                "ORDER BY valid_from DESC LIMIT ?",
+                "ORDER BY first_seen DESC LIMIT ?",
                 (region, now, limit),
             ).fetchall()
         if location:
             return conn.execute(
                 "SELECT * FROM notams WHERE location = ? AND (valid_to = '' OR valid_to > ?) "
-                "ORDER BY valid_from DESC LIMIT ?",
+                "ORDER BY first_seen DESC LIMIT ?",
                 (location, now, limit),
             ).fetchall()
         return conn.execute(
             "SELECT * FROM notams WHERE valid_to = '' OR valid_to > ? "
-            "ORDER BY valid_from DESC LIMIT ?",
+            "ORDER BY first_seen DESC LIMIT ?",
             (now, limit),
         ).fetchall()
 
@@ -601,46 +683,95 @@ def get_user_subscriptions(chat_id: int) -> List[str]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# BACKGROUND POLL TASK
+# WEB SCRAPERS (regional aggregators)
 # ─────────────────────────────────────────────────────────────────────────────
 
-BATCH_SIZE = 10  # number of FIR codes per API call
+def scrape_safeairspace() -> int:
+    """Scrape safeairspace.net for current conflict-zone advisories."""
+    try:
+        r = requests.get(
+            "https://safeairspace.net/",
+            headers={"User-Agent": "AirspaceBot/1.0"},
+            timeout=10,
+        )
+        soup = BeautifulSoup(r.text, "html.parser")
+        text = soup.get_text(separator="\n", strip=True)
+        if save_scraper_text("safeairspace", text):
+            logger.info("safeairspace: stored new advisory snapshot")
+            return 1
+        return 0
+    except Exception as exc:
+        logger.warning("safeairspace scrape failed: %s", exc)
+        return 0
 
 
-async def poll_and_alert(app: Application) -> None:
-    """Fetch fresh NOTAMs and dispatch alerts for any new entries."""
-    logger.info("Poll cycle started — %d FIRs in %d batches",
-                len(ALL_FIRS), -(-len(ALL_FIRS) // BATCH_SIZE))
+def scrape_iranwarlive() -> int:
+    """Scrape iranwarlive.com/airspace for Iranian airspace updates."""
+    try:
+        r = requests.get(
+            "https://iranwarlive.com/airspace",
+            headers={"User-Agent": "AirspaceBot/1.0"},
+            timeout=10,
+        )
+        soup = BeautifulSoup(r.text, "html.parser")
+        text = soup.get_text(separator="\n", strip=True)
+        if save_scraper_text("iranwarlive", text):
+            logger.info("iranwarlive: stored new advisory snapshot")
+            return 1
+        return 0
+    except Exception as exc:
+        logger.warning("iranwarlive scrape failed: %s", exc)
+        return 0
 
+
+def scrape_skyrestrict() -> int:
+    """Scrape skyrestrict-check.vercel.app for global airspace restrictions."""
+    try:
+        r = requests.get(
+            "https://skyrestrict-check.vercel.app/en",
+            headers={"User-Agent": "AirspaceBot/1.0"},
+            timeout=10,
+        )
+        soup = BeautifulSoup(r.text, "html.parser")
+        text = soup.get_text(separator="\n", strip=True)
+        if save_scraper_text("skyrestrict", text):
+            logger.info("skyrestrict: stored new advisory snapshot")
+            return 1
+        return 0
+    except Exception as exc:
+        logger.warning("skyrestrict scrape failed: %s", exc)
+        return 0
+
+
+async def run_scrapers(app: Application) -> None:
+    """Run every web scraper sequentially and dispatch any new alerts."""
+    logger.info("Scraper cycle started")
     new_total = 0
-    for i in range(0, len(ALL_FIRS), BATCH_SIZE):
-        batch = ALL_FIRS[i : i + BATCH_SIZE]
-        items = fetch_notams(batch)
-        for item in items:
-            # Determine best fallback location from batch
-            fallback = batch[0]
-            n = process_item(item, fallback)
-            if n and save_notam(n):
-                new_total += 1
+    new_total += scrape_safeairspace()
+    new_total += scrape_iranwarlive()
+    new_total += scrape_skyrestrict()
+    logger.info("Scraper cycle complete — %d new entries", new_total)
+    await dispatch_unalerted(app)
 
-    logger.info("Poll complete — %d new NOTAMs stored", new_total)
 
+# ─────────────────────────────────────────────────────────────────────────────
+# BACKGROUND POLL TASKS
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def dispatch_unalerted(app: Application) -> None:
     unalerted = get_unalerted()
     if not unalerted:
         return
-
-    logger.info("Dispatching alerts for %d NOTAMs", len(unalerted))
+    logger.info("Dispatching alerts for %d entries", len(unalerted))
     for notam in unalerted:
         text = format_alert(notam)
         region = notam["region"]
-        dispatched = False
 
         if CHANNEL_ID:
             try:
                 await app.bot.send_message(
                     chat_id=CHANNEL_ID, text=text, parse_mode=ParseMode.HTML
                 )
-                dispatched = True
             except TelegramError as exc:
                 logger.warning("Channel send failed: %s", exc)
 
@@ -650,13 +781,24 @@ async def poll_and_alert(app: Application) -> None:
                     await app.bot.send_message(
                         chat_id=chat_id, text=text, parse_mode=ParseMode.HTML
                     )
-                    dispatched = True
                 except TelegramError as exc:
                     logger.warning("Subscriber %d send failed: %s", chat_id, exc)
 
         mark_alerted(notam["notam_id"])
-
     logger.info("Alert cycle complete")
+
+
+async def poll_and_alert(app: Application) -> None:
+    """Fetch fresh SIGMETs and dispatch alerts for any new entries."""
+    logger.info("SIGMET poll started")
+    items = fetch_notams(ALL_FIRS)
+    new_total = 0
+    for item in items:
+        n = process_item(item, ALL_FIRS[0] if ALL_FIRS else "", source="aviationweather.gov")
+        if n and save_notam(n):
+            new_total += 1
+    logger.info("SIGMET poll complete — %d new", new_total)
+    await dispatch_unalerted(app)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -689,7 +831,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• /subscribe Ukraine — live alerts for Ukraine\n"
         "• /active — all active closures worldwide\n"
         "• /help — full command reference\n\n"
-        "Data refreshes every 15 minutes from aviationweather.gov."
+        "Sources: aviationweather.gov SIGMETs, safeairspace.net, iranwarlive.com, skyrestrict-check.vercel.app."
     )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
@@ -700,7 +842,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/start — Welcome message\n"
         "/help — This help text\n\n"
         "<b>Lookups:</b>\n"
-        "/notam &lt;ICAO&gt; — NOTAMs for a specific airport/FIR\n"
+        "/notam &lt;ICAO&gt; — NOTAMs/SIGMETs for a specific airport/FIR\n"
         "  <i>Example: /notam UUWW</i>\n"
         "/region &lt;name&gt; — Active closures for a region\n"
         "  <i>Example: /region Russia</i>\n"
@@ -733,14 +875,14 @@ async def cmd_notam(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     await update.message.reply_text(
-        f"\U0001f50d Fetching NOTAMs for <code>{he(icao)}</code>…",
+        f"\U0001f50d Fetching NOTAMs/SIGMETs for <code>{he(icao)}</code>…",
         parse_mode=ParseMode.HTML,
     )
 
     # Live fetch then return from DB
     items = fetch_notams([icao])
     for item in items:
-        n = process_item(item, icao)
+        n = process_item(item, icao, source="aviationweather.gov")
         if n:
             save_notam(n)
 
@@ -748,13 +890,13 @@ async def cmd_notam(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if not notams:
         await update.message.reply_text(
-            f"✅ No active NOTAMs found for <code>{he(icao)}</code>.",
+            f"✅ No active NOTAMs/SIGMETs found for <code>{he(icao)}</code>.",
             parse_mode=ParseMode.HTML,
         )
         return
 
     await update.message.reply_text(
-        f"Found <b>{len(notams)}</b> active NOTAM(s) for <code>{he(icao)}</code>:",
+        f"Found <b>{len(notams)}</b> active entry(ies) for <code>{he(icao)}</code>:",
         parse_mode=ParseMode.HTML,
     )
     for notam in notams[:5]:
@@ -876,8 +1018,8 @@ async def cmd_active(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     if not notams:
         await update.message.reply_text(
-            "✅ No active airspace closures in the database.\n\n"
-            "Data refreshes every 15 minutes. Use /notam &lt;ICAO&gt; for a live query.",
+            "✅ No active airspace closures in the database yet.\n\n"
+            "Sources refresh every 15–30 minutes. Use /notam &lt;ICAO&gt; for a live query.",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -901,7 +1043,7 @@ async def cmd_active(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
         reason = rnots[0]["reason"] or "Unknown"
         lines.append(
-            f"{sev_emoji} {flag} <b>{he(region)}</b> — {len(rnots)} NOTAM(s)"
+            f"{sev_emoji} {flag} <b>{he(region)}</b> — {len(rnots)} entry(ies)"
         )
         lines.append(f"   └ {he(reason)}")
 
@@ -932,11 +1074,13 @@ async def cmd_regions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def cmd_map(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "\U0001f5fa️ <b>Live Airspace Maps</b>\n\n"
+        '• <a href="https://safeairspace.net">SafeAirspace.net</a> — Conflict-zone advisories\n'
+        '• <a href="https://skyrestrict-check.vercel.app/en">SkyRestrict</a> — Global restrictions\n'
+        '• <a href="https://iranwarlive.com/airspace">IranWarLive</a> — Middle East airspace\n'
         '• <a href="https://skyvector.com">SkyVector</a> — Full NOTAM overlay worldwide\n'
         '• <a href="https://notams.aim.faa.gov/notamSearch/">FAA NOTAM Search</a> — Official US/global NOTAMs\n'
         '• <a href="https://www.public.nm.eurocontrol.int/">Eurocontrol NOP</a> — European flow management\n'
-        '• <a href="https://aviationweather.gov/notam">AviationWeather.gov</a> — Source data for this bot\n'
-        '• <a href="https://flightaware.com/misery/">FlightAware Misery Map</a> — Real-time delay tracker\n'
+        '• <a href="https://aviationweather.gov/">AviationWeather.gov</a> — SIGMET source\n'
         '• <a href="https://www.flightradar24.com">Flightradar24</a> — Live flight tracking'
     )
     await update.message.reply_text(
@@ -950,19 +1094,37 @@ async def cmd_map(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def _post_init(app: Application) -> None:
     scheduler = AsyncIOScheduler(timezone="UTC")
+
+    # SIGMET feed every POLL_INTERVAL minutes (default 15)
     scheduler.add_job(
         poll_and_alert,
         trigger="interval",
         minutes=POLL_INTERVAL,
         args=[app],
-        id="notam_poll",
-        next_run_time=datetime.now(timezone.utc),  # run immediately on startup
+        id="sigmet_poll",
+        next_run_time=datetime.now(timezone.utc),
         max_instances=1,
         coalesce=True,
     )
+
+    # Web scrapers every SCRAPE_INTERVAL minutes (default 30)
+    scheduler.add_job(
+        run_scrapers,
+        trigger="interval",
+        minutes=SCRAPE_INTERVAL,
+        args=[app],
+        id="web_scrapers",
+        next_run_time=datetime.now(timezone.utc),
+        max_instances=1,
+        coalesce=True,
+    )
+
     scheduler.start()
     app.bot_data["scheduler"] = scheduler
-    logger.info("Scheduler started — polling every %d minutes", POLL_INTERVAL)
+    logger.info(
+        "Scheduler started — SIGMETs every %d min, scrapers every %d min",
+        POLL_INTERVAL, SCRAPE_INTERVAL,
+    )
 
 
 async def _post_shutdown(app: Application) -> None:
