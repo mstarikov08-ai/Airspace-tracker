@@ -201,43 +201,201 @@ for _region, _data in REGIONS.items():
 
 ALL_FIRS: List[str] = list(FIR_TO_REGION.keys())
 
+# ICAO prefix -> broad region/country (2-letter prefixes checked before 1-letter)
+ICAO_PREFIX_REGION: Dict[str, str] = {
+    # 2-letter prefixes (more specific, checked first)
+    "RJ": "Japan",
+    "RO": "Japan",
+    "RK": "South Korea",
+    "RP": "Philippines",
+    "RC": "Taiwan",
+    "ZB": "China",
+    "ZG": "China",
+    "ZH": "China",
+    "ZJ": "China",
+    "ZL": "China",
+    "ZM": "Mongolia",
+    "ZP": "China",
+    "ZS": "China",
+    "ZU": "China",
+    "ZW": "China",
+    "ZY": "China",
+    "VH": "Australia",
+    "VT": "India",
+    "VE": "India",
+    "VI": "India",
+    "VN": "Nepal",
+    "VQ": "Bhutan",
+    "VR": "Maldives",
+    "VG": "Bangladesh",
+    "VY": "Myanmar",
+    "WS": "Singapore",
+    "WM": "Malaysia",
+    "WA": "Indonesia",
+    "WI": "Indonesia",
+    "WR": "Indonesia",
+    "UK": "Ukraine",
+    "UM": "Belarus",
+    "UB": "Azerbaijan",
+    "UD": "Armenia",
+    "UG": "Georgia",
+    "HK": "Kenya",
+    "HE": "Egypt",
+    "HA": "Ethiopia",
+    "HD": "Djibouti",
+    "SP": "Peru",
+    "SB": "Brazil",
+    "SK": "Colombia",
+    "SE": "Ecuador",
+    "SA": "Argentina",
+    "SY": "Guyana",
+    "SC": "Chile",
+    "SL": "Bolivia",
+    "SU": "Uruguay",
+    "FA": "South Africa",
+    "FB": "Botswana",
+    "FC": "Republic of Congo",
+    "FD": "Swaziland",
+    "FE": "Central African Republic",
+    "FG": "Equatorial Guinea",
+    "FH": "St. Helena",
+    "FI": "Mauritius",
+    "FJ": "British Indian Ocean Territory",
+    "FK": "Cameroon",
+    "FL": "Zambia",
+    "FM": "Madagascar",
+    "FN": "Angola",
+    "FO": "Gabon",
+    "FP": "Sao Tome",
+    "FQ": "Mozambique",
+    "FS": "Seychelles",
+    "FT": "Chad",
+    "FV": "Zimbabwe",
+    "FW": "Malawi",
+    "FX": "Lesotho",
+    "FY": "Namibia",
+    "FZ": "DR Congo",
+    # 1-letter prefixes (fallback)
+    "K": "USA",
+    "P": "Pacific Islands",
+    "T": "Caribbean",
+    "C": "Canada",
+    "M": "Central America",
+    "S": "South America",
+    "N": "Pacific Islands",
+    "A": "South/Southeast Asia",
+    "V": "South/Southeast Asia",
+    "W": "Southeast Asia",
+    "Y": "Australia",
+    "Z": "China",
+    "R": "Asia Pacific",
+    "L": "Southern Europe",
+    "E": "Northern Europe",
+    "B": "North Atlantic",
+    "G": "West Africa",
+    "D": "West Africa",
+    "H": "East Africa",
+    "F": "Africa",
+    "O": "Middle East",
+    "U": "Russia/CIS",
+}
+
+
+def icao_to_region(code: str) -> Optional[str]:
+    """Map any ICAO FIR/airport code to a region, without wrong fallback."""
+    if not code:
+        return None
+    # Exact match in our priority-region table
+    if code in FIR_TO_REGION:
+        return FIR_TO_REGION[code]
+    # 2-letter ICAO prefix (more specific)
+    prefix2 = code[:2].upper()
+    if prefix2 in ICAO_PREFIX_REGION:
+        return ICAO_PREFIX_REGION[prefix2]
+    # 1-letter ICAO prefix
+    prefix1 = code[:1].upper()
+    return ICAO_PREFIX_REGION.get(prefix1)
+
+
 # FIR code -> human-readable FIR name
 FIR_READABLE: Dict[str, str] = {
-    "UUWW": "Moscow FIR",
-    "UURR": "Rostov FIR",
-    "ULLL": "St. Petersburg FIR",
-    "URWW": "Volgograd FIR",
-    "USSS": "Yekaterinburg FIR",
-    "UHHH": "Khabarovsk FIR",
-    "UNKL": "Krasnoyarsk FIR",
-    "UOOO": "Novosibirsk FIR",
-    "UKBV": "Kyiv FIR",
-    "UKOO": "Odesa FIR",
-    "UKHH": "Kharkiv FIR",
-    "UKFV": "Simferopol FIR",
-    "UKDV": "Dnipro FIR",
-    "UMMV": "Minsk FIR",
-    "LLLL": "Tel Aviv FIR",
-    "OIIX": "Tehran FIR",
-    "OIIG": "Tehran ACC",
-    "OIIS": "Shiraz FIR",
-    "OIAF": "Ahvaz FIR",
-    "ORBB": "Baghdad FIR",
-    "OLBA": "Beirut FIR",
-    "OSTT": "Damascus FIR",
-    "LUUU": "Chisinau FIR",
-    "UGGG": "Tbilisi FIR",
-    "UDDD": "Yerevan FIR",
-    "UBBA": "Baku FIR",
-    "LTAA": "Ankara FIR",
-    "LTBB": "Istanbul FIR",
-    "OJAC": "Amman FIR",
-    "OEJD": "Jeddah FIR",
-    "OERR": "Riyadh FIR",
-    "OYSC": "Sanaa FIR",
-    "HLLL": "Tripoli FIR",
-    "OAKX": "Kabul FIR",
-    "OPKR": "Karachi FIR",
+    # Russia / CIS
+    "UUWW": "Moscow FIR, Russia",
+    "UURR": "Rostov FIR, Russia",
+    "ULLL": "St. Petersburg FIR, Russia",
+    "URWW": "Volgograd FIR, Russia",
+    "USSS": "Yekaterinburg FIR, Russia",
+    "UHHH": "Khabarovsk FIR, Russia",
+    "UNKL": "Krasnoyarsk FIR, Russia",
+    "UOOO": "Novosibirsk FIR, Russia",
+    # Ukraine
+    "UKBV": "Kyiv FIR, Ukraine",
+    "UKOO": "Odesa FIR, Ukraine",
+    "UKHH": "Kharkiv FIR, Ukraine",
+    "UKFV": "Simferopol FIR, Ukraine",
+    "UKDV": "Dnipro FIR, Ukraine",
+    # Belarus
+    "UMMV": "Minsk FIR, Belarus",
+    # Israel
+    "LLLL": "Tel Aviv FIR, Israel",
+    # Iran
+    "OIIX": "Tehran FIR, Iran",
+    "OIIG": "Tehran ACC, Iran",
+    "OIIS": "Shiraz FIR, Iran",
+    "OIAF": "Ahvaz FIR, Iran",
+    # Iraq
+    "ORBB": "Baghdad FIR, Iraq",
+    # Lebanon
+    "OLBA": "Beirut FIR, Lebanon",
+    # Syria
+    "OSTT": "Damascus FIR, Syria",
+    # Moldova / Caucasus
+    "LUUU": "Chisinau FIR, Moldova",
+    "UGGG": "Tbilisi FIR, Georgia",
+    "UDDD": "Yerevan FIR, Armenia",
+    "UBBA": "Baku FIR, Azerbaijan",
+    # Turkey
+    "LTAA": "Ankara FIR, Turkey",
+    "LTBB": "Istanbul FIR, Turkey",
+    # Middle East
+    "OJAC": "Amman FIR, Jordan",
+    "OEJD": "Jeddah FIR, Saudi Arabia",
+    "OERR": "Riyadh FIR, Saudi Arabia",
+    "OYSC": "Sanaa FIR, Yemen",
+    # Africa / Central Asia
+    "HLLL": "Tripoli FIR, Libya",
+    "OAKX": "Kabul FIR, Afghanistan",
+    "OPKR": "Karachi FIR, Pakistan",
+    "FAOR": "Johannesburg FIR, South Africa",
+    "FAJA": "Johannesburg FIR, South Africa",
+    # Japan
+    "RJJJ": "Fukuoka FIR, Japan",
+    "RJTD": "Tokyo FIR, Japan",
+    "RJJR": "Naha FIR, Japan",
+    "ROBY": "Naha FIR, Japan",
+    # Philippines
+    "RPHI": "Manila FIR, Philippines",
+    "RPLL": "Manila FIR, Philippines",
+    # South Korea
+    "RKRR": "Incheon FIR, South Korea",
+    # Southeast Asia
+    "VHHH": "Hong Kong FIR, China",
+    "WSJC": "Singapore FIR, Singapore",
+    "WAAF": "Jakarta FIR, Indonesia",
+    "WMFC": "Kuala Lumpur FIR, Malaysia",
+    # South America
+    "SPIM": "Lima FIR, Peru",
+    "SBBS": "Brasilia FIR, Brazil",
+    "SBBR": "Brasilia FIR, Brazil",
+    # India
+    "VIDF": "Delhi FIR, India",
+    "VABB": "Mumbai FIR, India",
+    "VOCX": "Chennai FIR, India",
+    "VECC": "Kolkata FIR, India",
+    # Australia / Pacific
+    "YMMM": "Melbourne FIR, Australia",
+    "YBBB": "Brisbane FIR, Australia",
+    "NZZO": "Auckland FIR, New Zealand",
 }
 
 # Display labels for scraped sources: source_key -> (group_label, emoji)
@@ -542,7 +700,7 @@ def location_display(loc: str) -> str:
     readable = FIR_READABLE.get(loc)
     if readable:
         return f"{readable} ({loc})"
-    return loc
+    return f"FIR {loc}"
 
 
 def format_alert(notam: sqlite3.Row) -> str:
@@ -647,7 +805,7 @@ def process_item(item: Any, fallback_location: str, source: str = "aviationweath
 
     vf = parse_time(start_raw)
     vt = parse_time(end_raw)
-    region = FIR_TO_REGION.get(location) or FIR_TO_REGION.get(fallback_location)
+    region = icao_to_region(location)
 
     # Determine reason: use SIGMET hazard code directly; fallback to keyword matching
     if sigmet_hazard:
@@ -737,6 +895,41 @@ def save_scraper_text(source: str, text: str) -> bool:
         return True
 
 
+def save_scraper_item(source: str, location: str, region: Optional[str],
+                      title: str, body: str, reason: str = "") -> bool:
+    """Store a single structured scraped advisory item as a NOTAM row."""
+    title = (title or "").strip()
+    body = (body or "").strip()
+    raw = f"{title}\n{body}".strip()
+    if not raw:
+        return False
+    digest = hashlib.sha256(f"{source}|{location}|{title}".encode()).hexdigest()[:24]
+    notam_id = f"{source}:{digest}"
+    description = (title or body)[:300]
+    with get_db() as conn:
+        if conn.execute("SELECT 1 FROM notams WHERE notam_id = ?", (notam_id,)).fetchone():
+            return False
+        conn.execute(
+            """
+            INSERT INTO notams
+                (notam_id, location, region, source, notam_type, raw_text, description,
+                 altitude_lower, altitude_upper, valid_from, valid_to,
+                 reason, severity, alerted, first_seen)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0,?)
+            """,
+            (
+                notam_id, (location or source).upper(), region, source,
+                "closure",
+                raw[:8000], description,
+                "", "", "", "",
+                reason or classify_reason(raw, "", None, None),
+                "Reported (scraped)",
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        return True
+
+
 def get_active_notams(
     region: Optional[str] = None,
     location: Optional[str] = None,
@@ -747,11 +940,21 @@ def get_active_notams(
     weather_filter = "AND (notam_type IS NULL OR notam_type != 'sigmet_weather')"
     with get_db() as conn:
         if region:
-            return conn.execute(
+            rows = conn.execute(
                 f"SELECT * FROM notams WHERE region = ? AND (valid_to = '' OR valid_to > ?) "
                 f"{weather_filter} ORDER BY first_seen DESC LIMIT ?",
                 (region, now, limit),
             ).fetchall()
+            if not rows:
+                # Also search scraped text for mentions of the region name
+                pattern = f"%{region}%"
+                rows = conn.execute(
+                    f"SELECT * FROM notams WHERE (raw_text LIKE ? OR description LIKE ? OR location LIKE ?) "
+                    f"AND (valid_to = '' OR valid_to > ?) {weather_filter} "
+                    f"ORDER BY first_seen DESC LIMIT ?",
+                    (pattern, pattern, pattern, now, limit),
+                ).fetchall()
+            return rows
         if location:
             return conn.execute(
                 f"SELECT * FROM notams WHERE location = ? AND (valid_to = '' OR valid_to > ?) "
@@ -836,76 +1039,186 @@ def get_user_subscriptions(chat_id: int) -> List[str]:
 # WEB SCRAPERS (regional aggregators)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _cs_get(url: str, timeout: int = 20):
+    """Fetch URL using cloudscraper to bypass Cloudflare; fall back to requests."""
+    try:
+        import cloudscraper
+        scraper = cloudscraper.create_scraper()
+        r = scraper.get(url, timeout=timeout)
+        logger.info("cloudscraper GET %s -> HTTP %d (%d bytes)", url, r.status_code, len(r.content))
+        logger.info("response preview: %s", r.text[:500])
+        return r
+    except ImportError:
+        logger.warning("cloudscraper not installed, falling back to requests")
+        return _fetch_url(url, timeout=timeout)
+    except Exception as exc:
+        logger.warning("cloudscraper GET %s failed: %s -- trying requests fallback", url, exc)
+        return _fetch_url(url, timeout=timeout)
+
+
+def _parse_nextjs_data(html: str) -> Optional[Dict]:
+    """Extract the __NEXT_DATA__ JSON blob embedded in Next.js pages."""
+    soup = BeautifulSoup(html, "html.parser")
+    tag = soup.find("script", id="__NEXT_DATA__")
+    if not tag:
+        return None
+    try:
+        return json.loads(tag.string or "")
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
 def scrape_safeairspace() -> int:
-    """Scrape safeairspace.net for current conflict-zone advisories."""
+    """Scrape safeairspace.net — individual country risk cards."""
     url = "https://safeairspace.net/"
-    r = _fetch_url(url)
-    if r is None:
-        logger.warning("safeairspace: no response")
-        return 0
-    if r.status_code != 200:
-        logger.warning("safeairspace: HTTP %d -- skipping", r.status_code)
-        logger.info("safeairspace response preview: %s", r.text[:500])
+    r = _cs_get(url)
+    if r is None or r.status_code != 200:
+        logger.warning("safeairspace: HTTP %s", getattr(r, "status_code", "no response"))
         return 0
     soup = BeautifulSoup(r.text, "html.parser")
-    content_tags = soup.find_all(["article", "section", "div"], class_=re.compile(r"(country|risk|advisory|warning|item|content)", re.I))
-    if content_tags:
-        text = "\n".join(t.get_text(separator=" ", strip=True) for t in content_tags)
+    saved = 0
+
+    # Each country advisory lives in a card/row — try multiple selectors
+    cards = (
+        soup.find_all(attrs={"data-country": True})
+        or soup.find_all(class_=re.compile(r"country.?card|advisory.?item|risk.?row|warning.?item", re.I))
+        or soup.find_all("tr")[1:]  # table rows, skip header
+    )
+    logger.info("safeairspace: %d candidate card(s) found", len(cards))
+
+    if cards:
+        for card in cards:
+            text = card.get_text(separator=" ", strip=True)
+            if len(text) < 8:
+                continue
+            heading = card.find(["h1", "h2", "h3", "h4", "strong", "th", "td"])
+            country = heading.get_text(strip=True) if heading else text[:60]
+            region = find_region(country) or icao_to_region(country[:4].upper())
+            if save_scraper_item("safeairspace", country[:60], region, country[:60], text):
+                saved += 1
     else:
-        text = soup.get_text(separator="\n", strip=True)
-    logger.info("safeairspace: extracted %d chars of text", len(text))
-    logger.info("safeairspace text preview: %s", text[:500])
-    saved = save_scraper_text("safeairspace", text)
-    logger.info("safeairspace: %s", "stored new snapshot" if saved else "no change (duplicate)")
-    return 1 if saved else 0
+        # Fallback: paragraph/list items mentioning risk levels
+        for el in soup.find_all(["p", "li"])[:60]:
+            text = el.get_text(strip=True)
+            if len(text) > 20 and re.search(r"(high|medium|low|closed|restricted|caution|avoid)", text, re.I):
+                if save_scraper_item("safeairspace", "safeairspace", None, text[:80], text):
+                    saved += 1
+
+    logger.info("safeairspace: %d new item(s) saved", saved)
+    return saved
 
 
 def scrape_iranwarlive() -> int:
-    """Scrape iranwarlive.com/airspace for Iranian airspace updates."""
+    """Scrape iranwarlive.com/airspace — individual WordPress articles."""
     url = "https://iranwarlive.com/airspace"
-    r = _fetch_url(url)
-    if r is None:
-        logger.warning("iranwarlive: no response")
-        return 0
-    if r.status_code != 200:
-        logger.warning("iranwarlive: HTTP %d -- skipping", r.status_code)
-        logger.info("iranwarlive response preview: %s", r.text[:500])
+    r = _cs_get(url)
+    if r is None or r.status_code != 200:
+        logger.warning("iranwarlive: HTTP %s", getattr(r, "status_code", "no response"))
         return 0
     soup = BeautifulSoup(r.text, "html.parser")
-    content_tags = soup.find_all(["article", "section", "p", "div"], class_=re.compile(r"(post|entry|content|article|news|update)", re.I))
-    if content_tags:
-        text = "\n".join(t.get_text(separator=" ", strip=True) for t in content_tags)
+    saved = 0
+
+    # WordPress: each post is an <article> element
+    articles = soup.find_all("article") or soup.find_all(
+        class_=re.compile(r"post|entry-content|article", re.I)
+    )
+    logger.info("iranwarlive: %d article(s) found", len(articles))
+
+    if articles:
+        for article in articles[:20]:
+            title_tag = article.find(["h1", "h2", "h3"])
+            title = title_tag.get_text(strip=True) if title_tag else ""
+            body = " ".join(p.get_text(strip=True) for p in article.find_all("p")[:5])
+            if not (title or body):
+                continue
+            if save_scraper_item("iranwarlive", "Iran", "Iran", title, body):
+                saved += 1
     else:
-        text = soup.get_text(separator="\n", strip=True)
-    logger.info("iranwarlive: extracted %d chars of text", len(text))
-    logger.info("iranwarlive text preview: %s", text[:500])
-    saved = save_scraper_text("iranwarlive", text)
-    logger.info("iranwarlive: %s", "stored new snapshot" if saved else "no change (duplicate)")
-    return 1 if saved else 0
+        # Fallback: headings followed by a paragraph
+        for tag in soup.find_all(["h2", "h3"])[:15]:
+            title = tag.get_text(strip=True)
+            nxt = tag.find_next_sibling("p")
+            body = nxt.get_text(strip=True) if nxt else ""
+            if len(title) > 10:
+                if save_scraper_item("iranwarlive", "Iran", "Iran", title, body):
+                    saved += 1
+
+    logger.info("iranwarlive: %d new item(s) saved", saved)
+    return saved
 
 
 def scrape_skyrestrict() -> int:
-    """Scrape skyrestrict-check.vercel.app for global airspace restrictions."""
+    """Scrape skyrestrict-check.vercel.app — __NEXT_DATA__ JSON, then HTML table."""
     url = "https://skyrestrict-check.vercel.app/en"
-    r = _fetch_url(url)
-    if r is None:
-        logger.warning("skyrestrict: no response")
+    r = _cs_get(url)
+    if r is None or r.status_code != 200:
+        logger.warning("skyrestrict: HTTP %s", getattr(r, "status_code", "no response"))
         return 0
-    if r.status_code != 200:
-        logger.warning("skyrestrict: HTTP %d -- skipping", r.status_code)
-        logger.info("skyrestrict response preview: %s", r.text[:500])
-        return 0
-    soup = BeautifulSoup(r.text, "html.parser")
-    content_tags = soup.find_all(["table", "tr", "li", "div", "section"], class_=re.compile(r"(country|zone|restrict|closure|item|row|entry)", re.I))
-    if content_tags:
-        text = "\n".join(t.get_text(separator=" ", strip=True) for t in content_tags)
-    else:
-        text = soup.get_text(separator="\n", strip=True)
-    logger.info("skyrestrict: extracted %d chars of text", len(text))
-    logger.info("skyrestrict text preview: %s", text[:500])
-    saved = save_scraper_text("skyrestrict", text)
-    logger.info("skyrestrict: %s", "stored new snapshot" if saved else "no change (duplicate)")
-    return 1 if saved else 0
+    saved = 0
+
+    # Primary: extract embedded Next.js JSON (most reliable)
+    nd = _parse_nextjs_data(r.text)
+    if nd:
+        logger.info("skyrestrict: found __NEXT_DATA__ (%d bytes)", len(str(nd)))
+        restrictions: list = []
+        for path in (
+            ["props", "pageProps", "restrictions"],
+            ["props", "pageProps", "data"],
+            ["props", "pageProps", "zones"],
+            ["props", "pageProps", "items"],
+        ):
+            try:
+                node = nd
+                for key in path:
+                    node = node[key]
+                if isinstance(node, list):
+                    restrictions = node
+                    logger.info("skyrestrict: list at %s (%d items)", ".".join(path), len(node))
+                    break
+            except (KeyError, TypeError):
+                continue
+
+        if restrictions:
+            for item in restrictions[:100]:
+                if not isinstance(item, dict):
+                    continue
+                country = str(item.get("country") or item.get("region") or item.get("name") or "")[:60]
+                status = str(item.get("status") or item.get("level") or "")
+                detail = str(item.get("reason") or item.get("description") or item.get("type") or "")
+                title = f"{country}: {status}".strip(": ") if (country or status) else detail[:80]
+                body = detail
+                if not (title or body):
+                    continue
+                region = find_region(country) or icao_to_region(country[:4].upper())
+                if save_scraper_item("skyrestrict", country or "skyrestrict", region, title, body):
+                    saved += 1
+        else:
+            # No known list key — store page props summary as one entry
+            page_props = nd.get("props", {}).get("pageProps", {})
+            summary = str(page_props)[:3000]
+            if summary and save_scraper_item("skyrestrict", "skyrestrict", None, "SkyRestrict page data", summary):
+                saved += 1
+
+    if not saved:
+        # Fallback: HTML table rows
+        soup = BeautifulSoup(r.text, "html.parser")
+        rows = soup.find_all("tr")[1:]
+        logger.info("skyrestrict: %d HTML table row(s) found", len(rows))
+        for row in rows[:100]:
+            cells = row.find_all(["td", "th"])
+            text = " | ".join(c.get_text(strip=True) for c in cells)
+            if len(text) > 5:
+                if save_scraper_item("skyrestrict", text[:60], None, text[:80], text):
+                    saved += 1
+        if not rows:
+            for el in soup.find_all(["li", "p"])[:40]:
+                text = el.get_text(strip=True)
+                if len(text) > 20:
+                    if save_scraper_item("skyrestrict", "skyrestrict", None, text[:80], text):
+                        saved += 1
+
+    logger.info("skyrestrict: %d new item(s) saved", saved)
+    return saved
 
 
 async def run_scrapers(app: Application) -> None:
@@ -1200,14 +1513,26 @@ async def cmd_active(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
         return
 
-    # Group by region; scraped entries (region=None) grouped by source label
+    _GENERIC_REASONS = {
+        "Unknown/restricted", "Restricted airspace",
+        "Military/government airspace", "Unknown", "",
+    }
+
+    # Group by region; safeairspace items grouped by specific country (location field);
+    # other scraped items grouped by source label
     by_group: Dict[str, list] = {}
     for n in notams:
         region = n["region"]
-        if region:
+        src = (n["source"] or "unknown").lower()
+        if region and region in REGIONS:
+            group_key = region
+        elif src == "safeairspace":
+            loc = (n["location"] or "").strip().upper()
+            # location field holds the country name stored via save_scraper_item
+            group_key = loc.title() if loc and loc != "SAFEAIRSPACE" else "Conflict Zones (SafeAirspace)"
+        elif region:
             group_key = region
         else:
-            src = (n["source"] or "unknown").lower()
             label, _ = SOURCE_DISPLAY.get(src, (f"Other ({src})", "\U0001f30d"))
             group_key = label
         by_group.setdefault(group_key, []).append(n)
@@ -1219,7 +1544,7 @@ async def cmd_active(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     sorted_groups = sorted(by_group, key=lambda k: (_priority(k), k))
 
     lines = [f"\U0001f30d <b>Active Airspace Closures</b> ({len(notams)} total)\n"]
-    for group in sorted_groups[:25]:
+    for group in sorted_groups[:30]:
         items = by_group[group]
         n0 = items[0]
 
@@ -1233,7 +1558,13 @@ async def cmd_active(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         _, sev_emoji = detect_severity(
             n0["altitude_lower"] or "", n0["altitude_upper"] or ""
         )
-        reason = n0["reason"] or "Unknown"
+
+        # Use actual description text when reason is generic
+        reason = (n0["reason"] or "").strip()
+        if reason in _GENERIC_REASONS:
+            reason = (n0["description"] or "").strip()[:120]
+        if not reason:
+            reason = "No details available"
 
         # Show readable FIR name if the group is a known region
         if group in REGIONS and n0["location"]:
