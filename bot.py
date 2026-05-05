@@ -1048,102 +1048,109 @@ def get_user_subscriptions(chat_id: int) -> List[str]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# WEB SCRAPERS — SafeAirspace country pages
+# NEWS SCRAPER — Google News RSS
 # ─────────────────────────────────────────────────────────────────────────────
 
-import time as _time
+import xml.etree.ElementTree as ET
 
-_SCRAPER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/119.0.0.0",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/118.0.0.0",
+_NEWS_QUERIES = [
+    "airspace+closed+Russia",
+    "airspace+closure+Ukraine+NOTAM",
+    "airspace+restricted+Iran+Israel",
+    "airspace+closed+Iraq+Syria",
+    "NOTAM+military+airspace+closure",
 ]
 
-_AIRSPACE_KEYWORDS = re.compile(
-    r"(closed|restricted|NOTAM|FIR|airspace|military|conflict|closure|prohibited)",
-    re.IGNORECASE,
+_NEWS_COUNTRIES = [
+    "Russia", "Ukraine", "Iran", "Israel", "Iraq",
+    "Syria", "Belarus", "Lebanon", "Qatar", "Yemen",
+]
+
+_NEWS_COUNTRY_RE = re.compile(
+    "|".join(re.escape(c) for c in _NEWS_COUNTRIES), re.IGNORECASE
 )
 
-_COUNTRY_PAGES = [
-    ("russia",  "Russia"),
-    ("ukraine", "Ukraine"),
-    ("iran",    "Iran"),
-    ("israel",  "Israel"),
-    ("iraq",    "Iraq"),
-    ("belarus", "Belarus"),
-]
+
+def _detect_country(text: str) -> Optional[str]:
+    """Return the first known country name found in text, or None."""
+    m = _NEWS_COUNTRY_RE.search(text)
+    return m.group(0).title() if m else None
 
 
-def _scrape_country_page(slug: str, country: str) -> int:
-    """Scrape safeairspace.net/<slug>/ and store each relevant sentence as a record."""
-    import cloudscraper
-    import random
-
-    url = f"https://safeairspace.net/{slug}/"
-    agent = random.choice(_SCRAPER_AGENTS)
-    try:
-        scraper = cloudscraper.create_scraper()
-        scraper.headers.update({"User-Agent": agent})
-        r = scraper.get(url, timeout=20)
-    except Exception as exc:
-        logger.warning("safeairspace/%s: request failed: %s", slug, exc)
-        print(f"SAFEAIRSPACE/{slug.upper()} ERROR: {exc}")
-        return 0
-
-    print(f"SAFEAIRSPACE/{slug.upper()} status: {r.status_code}")
-    print(f"SAFEAIRSPACE/{slug.upper()} text: {r.text[:300]}")
-    logger.info("safeairspace/%s: HTTP %d (%d bytes)", slug, r.status_code, len(r.content))
-
-    if r.status_code != 200:
-        logger.warning("safeairspace/%s: HTTP %d — skipping", slug, r.status_code)
-        return 0
-
-    soup = BeautifulSoup(r.text, "html.parser")
-    region = find_region(country) or country
-
-    # Collect all text nodes (paragraphs, list items, table cells)
-    raw_chunks: List[str] = []
-    for tag in soup.find_all(["p", "li", "td", "h2", "h3", "h4"]):
-        text = tag.get_text(separator=" ", strip=True)
-        if text:
-            raw_chunks.append(text)
-
-    # Split into sentences and keep those containing airspace keywords
+def fetch_google_news_rss() -> int:
+    """Fetch Google News RSS for airspace-related queries and store recent items."""
+    base = "https://news.google.com/rss/search"
+    cutoff = datetime.now(timezone.utc) - __import__("datetime").timedelta(hours=48)
     saved = 0
-    seen: set = set()
-    for chunk in raw_chunks:
-        sentences = re.split(r"(?<=[.!?])\s+", chunk)
-        for sentence in sentences:
-            sentence = sentence.strip()
-            if len(sentence) < 20:
-                continue
-            if not _AIRSPACE_KEYWORDS.search(sentence):
-                continue
-            key = sentence[:120]
-            if key in seen:
-                continue
-            seen.add(key)
-            # Also detect any FIR codes in this sentence
-            fir_hits = [f for f in re.findall(r"\b([A-Z]{4})\b", sentence.upper()) if f in FIR_READABLE]
-            fir_note = " | ".join(f"{f}: {FIR_READABLE[f]}" for f in dict.fromkeys(fir_hits)[:3])
-            body = f"{sentence}\n{fir_note}".strip() if fir_note else sentence
-            title = sentence[:80]
-            if save_scraper_item("safeairspace", country, region, title, body):
-                saved += 1
 
-    print(f"Saved {saved} records from safeairspace/{slug}")
-    logger.info("safeairspace/%s: %d new record(s) saved", slug, saved)
+    for query in _NEWS_QUERIES:
+        url = f"{base}?q={query}&hl=en&gl=US&ceid=US:en"
+        print(f"Google News RSS: fetching {url}")
+        try:
+            resp = requests.get(
+                url,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; AirspaceBot/1.0)"},
+                timeout=15,
+            )
+            print(f"Google News RSS status: {resp.status_code}")
+            if resp.status_code != 200:
+                logger.warning("google_news: query=%s HTTP %d", query, resp.status_code)
+                continue
+
+            root = ET.fromstring(resp.content)
+            items = root.findall(".//item")
+            print(f"Google News RSS: {len(items)} items for query '{query}'")
+
+            for item in items:
+                title = (item.findtext("title") or "").strip()
+                description = (item.findtext("description") or "").strip()
+                pub_date_str = (item.findtext("pubDate") or "").strip()
+                link = (item.findtext("link") or "").strip()
+
+                if not title:
+                    continue
+
+                # Parse and filter by age
+                pub_dt: Optional[datetime] = None
+                if pub_date_str:
+                    for fmt in (
+                        "%a, %d %b %Y %H:%M:%S %Z",
+                        "%a, %d %b %Y %H:%M:%S %z",
+                    ):
+                        try:
+                            pub_dt = datetime.strptime(pub_date_str, fmt)
+                            if pub_dt.tzinfo is None:
+                                pub_dt = pub_dt.replace(tzinfo=timezone.utc)
+                            break
+                        except ValueError:
+                            pass
+
+                if pub_dt and pub_dt < cutoff:
+                    continue
+
+                country = _detect_country(title) or _detect_country(description)
+                region = find_region(country) if country else None
+                location = country or "World"
+                date_label = pub_dt.strftime("%Y-%m-%d %H:%M UTC") if pub_dt else pub_date_str
+                body = f"{description}\n\nPublished: {date_label}\nSource: {link}".strip()
+
+                if save_scraper_item("google_news", location, region, title, body):
+                    saved += 1
+
+        except ET.ParseError as exc:
+            logger.warning("google_news: XML parse error for query=%s: %s", query, exc)
+        except Exception as exc:
+            logger.warning("google_news: query=%s failed: %s", query, exc)
+
+    print(f"Saved {saved} records from google_news")
+    logger.info("google_news: %d new record(s) saved", saved)
     return saved
 
 
 async def run_scrapers(app: Application) -> None:
-    """Scrape all 6 SafeAirspace country pages with a 2-second delay between each."""
+    """Fetch Google News RSS and dispatch new alerts."""
     logger.info("Scraper cycle started")
-    total = 0
-    for i, (slug, country) in enumerate(_COUNTRY_PAGES):
-        if i > 0:
-            _time.sleep(2)
-        total += _scrape_country_page(slug, country)
+    total = fetch_google_news_rss()
     print(f"Scraper cycle complete — total new records: {total}")
     logger.info("Scraper cycle complete — %d new records", total)
     await dispatch_unalerted(app)
@@ -1434,7 +1441,7 @@ async def cmd_active(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         "Unknown/restricted", "Restricted airspace",
         "Military/government airspace", "Unknown", "",
     }
-    _SCRAPER_SOURCES = {"safeairspace"}
+    _SCRAPER_SOURCES = {"google_news"}
 
     # Separate volcanic-ash closures from scraped conflict-zone data
     va_notams = [n for n in notams if (n["source"] or "").lower() not in _SCRAPER_SOURCES]
@@ -1471,41 +1478,25 @@ async def cmd_active(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             lines.append(f"{sev_emoji} {flag} <b>{he(group)}</b>{loc_hint} — {len(items)} entry(ies)")
             lines.append(f"   └ {he(reason)}")
 
-    # ── Section 2: Conflict-zone scrapers ───────────────────────────────────
+    # ── Section 2: Google News recent closures ──────────────────────────────
     lines.append("")
-    lines.append("⚠️ <b>Conflict Zone Advisories</b>")
+    lines.append("\U0001f4f0 <b>Recent Closures (Google News)</b>")
 
     if not conflict_notams:
-        lines.append("⚠️ Conflict data temporarily unavailable")
-        lines.append("<i>Sources: safeairspace.net · iranwarlive.com · skyrestrict-check.vercel.app</i>")
+        lines.append("   <i>No recent news items — check back in 15 minutes</i>")
     else:
-        by_conflict: Dict[str, list] = {}
-        for n in conflict_notams:
-            src = (n["source"] or "unknown").lower()
-            if src == "safeairspace":
-                loc = (n["location"] or "").strip().upper()
-                group_key = loc.title() if loc and loc != "SAFEAIRSPACE" else "Conflict Zones (SafeAirspace)"
-            elif n["region"] and n["region"] in REGIONS:
-                group_key = n["region"]
-            elif n["region"]:
-                group_key = n["region"]
-            else:
-                label, _ = SOURCE_DISPLAY.get(src, (f"Other ({src})", "\U0001f30d"))
-                group_key = label
-            by_conflict.setdefault(group_key, []).append(n)
-
-        for group in sorted(by_conflict)[:20]:
-            items = by_conflict[group]
-            n0 = items[0]
-            src = (n0["source"] or "").lower()
-            flag = REGIONS.get(group, {}).get("flag") or SOURCE_DISPLAY.get(src, ("\U0001f30d", "⚠️"))[1]
-            reason = (n0["reason"] or "").strip()
-            if reason in _GENERIC_REASONS:
-                reason = (n0["description"] or "").strip()[:120]
-            if not reason:
-                reason = "No details available"
-            lines.append(f"⚠️ {flag} <b>{he(group)}</b> — {len(items)} entry(ies)")
-            lines.append(f"   └ {he(reason)}")
+        # Sort by first_seen descending, show up to 10 items
+        news_sorted = sorted(conflict_notams, key=lambda n: n["first_seen"] or "", reverse=True)
+        for n in news_sorted[:10]:
+            title = (n["description"] or n["reason"] or "").strip()
+            # Extract pubDate from body (stored as "Published: ...")
+            raw = n["raw_text"] or ""
+            pub_match = re.search(r"Published:\s*(.+?)(?:\n|$)", raw)
+            pub_label = pub_match.group(1).strip() if pub_match else (n["first_seen"] or "")[:16]
+            country = (n["location"] or "").title()
+            flag = REGIONS.get(n["region"] or "", {}).get("flag", "\U0001f4f0")
+            lines.append(f"{flag} <b>{he(country)}</b> — {he(title[:100])}")
+            lines.append(f"   └ 🕐 {he(pub_label)}")
 
     lines.append("\nUse <code>/region NAME</code> for details.")
 
