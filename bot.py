@@ -1048,327 +1048,104 @@ def get_user_subscriptions(chat_id: int) -> List[str]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# WEB SCRAPERS (regional aggregators)
+# WEB SCRAPERS — SafeAirspace country pages
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _cs_get(url: str, timeout: int = 20):
-    """Always use cloudscraper (bypasses Cloudflare/bot checks); fall back to requests."""
-    try:
-        import cloudscraper
-        scraper = cloudscraper.create_scraper()
-        r = scraper.get(url, timeout=timeout)
-        print(f"[scraper] GET {url} -> HTTP {r.status_code} ({len(r.content)} bytes)")
-        print(f"[scraper] preview: {r.text[:500]}")
-        logger.info("cloudscraper GET %s -> HTTP %d (%d bytes)", url, r.status_code, len(r.content))
-        if r.status_code in (403, 429, 503):
-            logger.warning("[scraper] blocked (%d) for %s — body: %s", r.status_code, url, r.text[:300])
-        return r
-    except ImportError:
-        logger.warning("cloudscraper not installed — install it: pip install cloudscraper")
-        return _fetch_url(url, timeout=timeout)
-    except Exception as exc:
-        logger.warning("cloudscraper GET %s failed: %s", url, exc)
-        return _fetch_url(url, timeout=timeout)
+import time as _time
+
+_SCRAPER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/119.0.0.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/118.0.0.0",
+]
+
+_AIRSPACE_KEYWORDS = re.compile(
+    r"(closed|restricted|NOTAM|FIR|airspace|military|conflict|closure|prohibited)",
+    re.IGNORECASE,
+)
+
+_COUNTRY_PAGES = [
+    ("russia",  "Russia"),
+    ("ukraine", "Ukraine"),
+    ("iran",    "Iran"),
+    ("israel",  "Israel"),
+    ("iraq",    "Iraq"),
+    ("belarus", "Belarus"),
+]
 
 
-def _parse_nextjs_data(html: str) -> Optional[Dict]:
-    """Extract the __NEXT_DATA__ JSON blob embedded in Next.js pages."""
-    soup = BeautifulSoup(html, "html.parser")
-    tag = soup.find("script", id="__NEXT_DATA__")
-    if not tag:
-        return None
-    try:
-        return json.loads(tag.string or "")
-    except (json.JSONDecodeError, TypeError):
-        return None
+def _scrape_country_page(slug: str, country: str) -> int:
+    """Scrape safeairspace.net/<slug>/ and store each relevant sentence as a record."""
+    import cloudscraper
+    import random
 
-
-def scrape_safeairspace() -> int:
-    """Scrape safeairspace.net — individual country risk cards."""
-    url = "https://safeairspace.net/"
-    r = _cs_get(url)
-    print(f"SAFEAIRSPACE status: {getattr(r, 'status_code', 'no response')}")
-    print(f"SAFEAIRSPACE text: {getattr(r, 'text', '')[:500]}")
-    if r is None or r.status_code != 200:
-        logger.warning("safeairspace: bad response HTTP %s — skipping", getattr(r, "status_code", "none"))
-        return 0
-
-    soup = BeautifulSoup(r.text, "html.parser")
-    saved = 0
-
-    # Try data-country attributes, then class-based cards, then table rows
-    cards = (
-        soup.find_all(attrs={"data-country": True})
-        or soup.find_all(class_=re.compile(r"country.?card|advisory.?item|risk.?row|warning.?item", re.I))
-        or soup.find_all("tr")[1:]
-    )
-    print(f"SAFEAIRSPACE cards found: {len(cards)}")
-    logger.info("safeairspace: %d candidate card(s) found", len(cards))
-
-    if cards:
-        for card in cards:
-            text = card.get_text(separator=" ", strip=True)
-            if len(text) < 8:
-                continue
-            heading = card.find(["h1", "h2", "h3", "h4", "strong", "th", "td"])
-            country = heading.get_text(strip=True) if heading else text[:60]
-            region = find_region(country) or icao_to_region(country[:4].upper())
-            if save_scraper_item("safeairspace", country[:60], region, country[:60], text):
-                saved += 1
-    else:
-        # Fallback: any paragraph/list item mentioning a risk level
-        for el in soup.find_all(["p", "li"])[:60]:
-            text = el.get_text(strip=True)
-            if len(text) > 20 and re.search(r"(high|medium|low|closed|restricted|caution|avoid)", text, re.I):
-                if save_scraper_item("safeairspace", "safeairspace", None, text[:80], text):
-                    saved += 1
-
-    print(f"Saved {saved} records from safeairspace")
-    logger.info("safeairspace: %d new item(s) saved", saved)
-    return saved
-
-
-def scrape_iranwarlive() -> int:
-    """Scrape iranwarlive.com/airspace — individual WordPress articles."""
-    url = "https://iranwarlive.com/airspace"
-    r = _cs_get(url)
-    print(f"IRANWARLIVE status: {getattr(r, 'status_code', 'no response')}")
-    print(f"IRANWARLIVE text: {getattr(r, 'text', '')[:500]}")
-    if r is None or r.status_code != 200:
-        logger.warning("iranwarlive: bad response HTTP %s — skipping", getattr(r, "status_code", "none"))
-        return 0
-
-    soup = BeautifulSoup(r.text, "html.parser")
-    saved = 0
-
-    # WordPress: each post is an <article> element
-    articles = soup.find_all("article") or soup.find_all(
-        class_=re.compile(r"post|entry-content|article", re.I)
-    )
-    print(f"IRANWARLIVE articles found: {len(articles)}")
-    logger.info("iranwarlive: %d article(s) found", len(articles))
-
-    if articles:
-        for article in articles[:20]:
-            title_tag = article.find(["h1", "h2", "h3"])
-            title = title_tag.get_text(strip=True) if title_tag else ""
-            body = " ".join(p.get_text(strip=True) for p in article.find_all("p")[:5])
-            if not (title or body):
-                continue
-            if save_scraper_item("iranwarlive", "Iran", "Iran", title, body):
-                saved += 1
-    else:
-        # Fallback: headings followed by a paragraph
-        for tag in soup.find_all(["h2", "h3"])[:15]:
-            title = tag.get_text(strip=True)
-            nxt = tag.find_next_sibling("p")
-            body = nxt.get_text(strip=True) if nxt else ""
-            if len(title) > 10:
-                if save_scraper_item("iranwarlive", "Iran", "Iran", title, body):
-                    saved += 1
-
-    print(f"Saved {saved} records from iranwarlive")
-    logger.info("iranwarlive: %d new item(s) saved", saved)
-    return saved
-
-
-def scrape_skyrestrict() -> int:
-    """Scrape skyrestrict-check.vercel.app — __NEXT_DATA__ JSON, then HTML table."""
-    url = "https://skyrestrict-check.vercel.app/en"
-    r = _cs_get(url)
-    print(f"SKYRESTRICT status: {getattr(r, 'status_code', 'no response')}")
-    print(f"SKYRESTRICT text: {getattr(r, 'text', '')[:500]}")
-    if r is None or r.status_code != 200:
-        logger.warning("skyrestrict: bad response HTTP %s — skipping", getattr(r, "status_code", "none"))
-        return 0
-
-    saved = 0
-
-    # Primary: embedded Next.js JSON
-    nd = _parse_nextjs_data(r.text)
-    if nd:
-        logger.info("skyrestrict: found __NEXT_DATA__ (%d bytes)", len(str(nd)))
-        restrictions: list = []
-        for path in (
-            ["props", "pageProps", "restrictions"],
-            ["props", "pageProps", "data"],
-            ["props", "pageProps", "zones"],
-            ["props", "pageProps", "items"],
-        ):
-            try:
-                node = nd
-                for key in path:
-                    node = node[key]
-                if isinstance(node, list):
-                    restrictions = node
-                    logger.info("skyrestrict: list at %s (%d items)", ".".join(path), len(node))
-                    break
-            except (KeyError, TypeError):
-                continue
-
-        if restrictions:
-            for item in restrictions[:100]:
-                if not isinstance(item, dict):
-                    continue
-                country = str(item.get("country") or item.get("region") or item.get("name") or "")[:60]
-                status = str(item.get("status") or item.get("level") or "")
-                detail = str(item.get("reason") or item.get("description") or item.get("type") or "")
-                title = f"{country}: {status}".strip(": ") if (country or status) else detail[:80]
-                body = detail
-                if not (title or body):
-                    continue
-                region = find_region(country) or icao_to_region(country[:4].upper())
-                if save_scraper_item("skyrestrict", country or "skyrestrict", region, title, body):
-                    saved += 1
-        else:
-            page_props = nd.get("props", {}).get("pageProps", {})
-            summary = str(page_props)[:3000]
-            if summary and save_scraper_item("skyrestrict", "skyrestrict", None, "SkyRestrict page data", summary):
-                saved += 1
-
-    if not saved:
-        # Fallback: HTML table rows
-        soup = BeautifulSoup(r.text, "html.parser")
-        rows = soup.find_all("tr")[1:]
-        print(f"SKYRESTRICT HTML table rows: {len(rows)}")
-        logger.info("skyrestrict: %d HTML table row(s) found", len(rows))
-        for row in rows[:100]:
-            cells = row.find_all(["td", "th"])
-            text = " | ".join(c.get_text(strip=True) for c in cells)
-            if len(text) > 5:
-                if save_scraper_item("skyrestrict", text[:60], None, text[:80], text):
-                    saved += 1
-        if not rows:
-            for el in soup.find_all(["li", "p"])[:40]:
-                text = el.get_text(strip=True)
-                if len(text) > 20:
-                    if save_scraper_item("skyrestrict", "skyrestrict", None, text[:80], text):
-                        saved += 1
-
-    print(f"Saved {saved} records from skyrestrict")
-    logger.info("skyrestrict: %d new item(s) saved", saved)
-    return saved
-
-
-def _scrape_safeairspace_country(slug: str, source: str, region: str) -> int:
-    """Scrape a SafeAirspace country detail page and store per-section advisories."""
     url = f"https://safeairspace.net/{slug}/"
-    r = _cs_get(url)
-    print(f"SAFEAIRSPACE/{slug.upper()} status: {getattr(r, 'status_code', 'no response')}")
-    print(f"SAFEAIRSPACE/{slug.upper()} text: {getattr(r, 'text', '')[:500]}")
-    if r is None or r.status_code != 200:
-        logger.warning("safeairspace/%s: HTTP %s — skipping", slug, getattr(r, "status_code", "none"))
+    agent = random.choice(_SCRAPER_AGENTS)
+    try:
+        scraper = cloudscraper.create_scraper()
+        scraper.headers.update({"User-Agent": agent})
+        r = scraper.get(url, timeout=20)
+    except Exception as exc:
+        logger.warning("safeairspace/%s: request failed: %s", slug, exc)
+        print(f"SAFEAIRSPACE/{slug.upper()} ERROR: {exc}")
+        return 0
+
+    print(f"SAFEAIRSPACE/{slug.upper()} status: {r.status_code}")
+    print(f"SAFEAIRSPACE/{slug.upper()} text: {r.text[:300]}")
+    logger.info("safeairspace/%s: HTTP %d (%d bytes)", slug, r.status_code, len(r.content))
+
+    if r.status_code != 200:
+        logger.warning("safeairspace/%s: HTTP %d — skipping", slug, r.status_code)
         return 0
 
     soup = BeautifulSoup(r.text, "html.parser")
-    page_text = soup.get_text(separator=" ", strip=True)
+    region = find_region(country) or country
+
+    # Collect all text nodes (paragraphs, list items, table cells)
+    raw_chunks: List[str] = []
+    for tag in soup.find_all(["p", "li", "td", "h2", "h3", "h4"]):
+        text = tag.get_text(separator=" ", strip=True)
+        if text:
+            raw_chunks.append(text)
+
+    # Split into sentences and keep those containing airspace keywords
     saved = 0
-
-    # Find all ICAO-style 4-letter codes mentioned on the page
-    found_firs = sorted({
-        m for m in re.findall(r"\b([A-Z]{4})\b", page_text.upper())
-        if m in FIR_READABLE
-    })
-    fir_summary = " | ".join(f"{f}: {FIR_READABLE[f]}" for f in found_firs[:8])
-    logger.info("safeairspace/%s: FIRs found: %s", slug, fir_summary or "none")
-
-    # Extract heading-delimited sections
-    sections: List[Tuple[str, str]] = []
-    for heading in soup.find_all(["h1", "h2", "h3", "h4"]):
-        title = heading.get_text(strip=True)
-        if len(title) < 4:
-            continue
-        body_parts: List[str] = []
-        for sib in heading.find_next_siblings():
-            if sib.name in ("h1", "h2", "h3", "h4"):
-                break
-            t = sib.get_text(separator=" ", strip=True)
-            if t:
-                body_parts.append(t)
-        body = " ".join(body_parts)[:600]
-        sections.append((title, body))
-
-    if sections:
-        for title, body in sections:
-            full_body = f"{body}\nFIRs: {fir_summary}".strip() if fir_summary else body
-            if save_scraper_item(source, region, region, title, full_body):
+    seen: set = set()
+    for chunk in raw_chunks:
+        sentences = re.split(r"(?<=[.!?])\s+", chunk)
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if len(sentence) < 20:
+                continue
+            if not _AIRSPACE_KEYWORDS.search(sentence):
+                continue
+            key = sentence[:120]
+            if key in seen:
+                continue
+            seen.add(key)
+            # Also detect any FIR codes in this sentence
+            fir_hits = [f for f in re.findall(r"\b([A-Z]{4})\b", sentence.upper()) if f in FIR_READABLE]
+            fir_note = " | ".join(f"{f}: {FIR_READABLE[f]}" for f in dict.fromkeys(fir_hits)[:3])
+            body = f"{sentence}\n{fir_note}".strip() if fir_note else sentence
+            title = sentence[:80]
+            if save_scraper_item("safeairspace", country, region, title, body):
                 saved += 1
-    else:
-        # Fallback: store paragraph chunks
-        for el in soup.find_all(["p", "li"])[:30]:
-            text = el.get_text(strip=True)
-            if len(text) > 30:
-                body = f"{text}\nFIRs: {fir_summary}".strip() if fir_summary else text
-                if save_scraper_item(source, region, region, text[:80], body):
-                    saved += 1
 
     print(f"Saved {saved} records from safeairspace/{slug}")
-    logger.info("safeairspace/%s: %d new item(s) saved", slug, saved)
-    return saved
-
-
-def scrape_faa_nms() -> int:
-    """Try the FAA NMS API (launched April 2026) for NOTAMs at key conflict locations."""
-    base_url = "https://nms.aim.faa.gov/api/v1/notams"
-    locations = ["UUWW", "UKBV", "OIIX", "LLLL", "ORBB", "UMMV"]
-    saved = 0
-    for loc in locations:
-        try:
-            r = requests.get(
-                base_url,
-                params={"location": loc},
-                headers={"User-Agent": "AirspaceBot/1.0", "Accept": "application/json"},
-                timeout=15,
-            )
-            print(f"FAA NMS {loc} status: {r.status_code}")
-            if r.status_code in (401, 403, 404, 429, 501, 502, 503):
-                logger.info("faa_nms: %s returned %d — skipping", loc, r.status_code)
-                continue
-            if r.status_code != 200:
-                continue
-            data = r.json()
-            items = data if isinstance(data, list) else (
-                data.get("items") or data.get("notams") or data.get("data") or []
-            )
-            for item in (items if isinstance(items, list) else [])[:20]:
-                if not isinstance(item, dict):
-                    continue
-                notam_id = str(item.get("notamNumber") or item.get("id") or "")
-                location = str(item.get("location") or loc)
-                text = str(item.get("text") or item.get("message") or item.get("body") or "")
-                if not text:
-                    continue
-                region = icao_to_region(location) or find_region(location)
-                fir_name = FIR_READABLE.get(location, location)
-                title = f"NOTAM {notam_id} — {fir_name}".strip(" —")
-                if save_scraper_item("faa_nms", location, region, title, text):
-                    saved += 1
-        except Exception as exc:
-            logger.info("faa_nms: %s error: %s", loc, exc)
-    print(f"Saved {saved} records from faa_nms")
-    logger.info("faa_nms: %d new item(s) saved", saved)
+    logger.info("safeairspace/%s: %d new record(s) saved", slug, saved)
     return saved
 
 
 async def run_scrapers(app: Application) -> None:
-    """Run every web scraper sequentially and dispatch any new alerts."""
+    """Scrape all 6 SafeAirspace country pages with a 2-second delay between each."""
     logger.info("Scraper cycle started")
-    new_total = 0
-    new_total += scrape_safeairspace()
-    new_total += scrape_iranwarlive()
-    new_total += scrape_skyrestrict()
-    # Country-specific SafeAirspace detail pages
-    for slug, source, region in [
-        ("russia",  "safeairspace_russia",  "Russia"),
-        ("ukraine", "safeairspace_ukraine", "Ukraine"),
-        ("iran",    "safeairspace_iran",    "Iran"),
-        ("israel",  "safeairspace_israel",  "Israel"),
-        ("iraq",    "safeairspace_iraq",    "Iraq"),
-        ("belarus", "safeairspace_belarus", "Belarus"),
-    ]:
-        new_total += _scrape_safeairspace_country(slug, source, region)
-    new_total += scrape_faa_nms()
-    logger.info("Scraper cycle complete -- %d new entries", new_total)
+    total = 0
+    for i, (slug, country) in enumerate(_COUNTRY_PAGES):
+        if i > 0:
+            _time.sleep(2)
+        total += _scrape_country_page(slug, country)
+    print(f"Scraper cycle complete — total new records: {total}")
+    logger.info("Scraper cycle complete — %d new records", total)
     await dispatch_unalerted(app)
 
 
@@ -1657,11 +1434,7 @@ async def cmd_active(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         "Unknown/restricted", "Restricted airspace",
         "Military/government airspace", "Unknown", "",
     }
-    _SCRAPER_SOURCES = {
-        "safeairspace", "safeairspace_russia", "safeairspace_ukraine",
-        "safeairspace_iran", "safeairspace_israel", "safeairspace_iraq",
-        "safeairspace_belarus", "iranwarlive", "skyrestrict", "faa_nms",
-    }
+    _SCRAPER_SOURCES = {"safeairspace"}
 
     # Separate volcanic-ash closures from scraped conflict-zone data
     va_notams = [n for n in notams if (n["source"] or "").lower() not in _SCRAPER_SOURCES]
