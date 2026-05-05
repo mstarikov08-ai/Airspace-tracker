@@ -321,13 +321,18 @@ def icao_to_region(code: str) -> Optional[str]:
 FIR_READABLE: Dict[str, str] = {
     # Russia / CIS
     "UUWW": "Moscow FIR, Russia",
+    "UUWV": "Moscow FIR, Russia",
     "UURR": "Rostov FIR, Russia",
+    "URRV": "Rostov FIR, Russia",
     "ULLL": "St. Petersburg FIR, Russia",
+    "UWWW": "Samara FIR, Russia",
     "URWW": "Volgograd FIR, Russia",
     "USSS": "Yekaterinburg FIR, Russia",
     "UHHH": "Khabarovsk FIR, Russia",
     "UNKL": "Krasnoyarsk FIR, Russia",
     "UOOO": "Novosibirsk FIR, Russia",
+    "UUEE": "Sheremetyevo, Russia",
+    "UUBW": "Zhukovsky, Russia",
     # Ukraine
     "UKBV": "Kyiv FIR, Ukraine",
     "UKOO": "Odesa FIR, Ukraine",
@@ -401,8 +406,15 @@ FIR_READABLE: Dict[str, str] = {
 # Display labels for scraped sources: source_key -> (group_label, emoji)
 SOURCE_DISPLAY: Dict[str, Tuple[str, str]] = {
     "safeairspace": ("Conflict Zones (SafeAirspace)", "⚠️"),
+    "safeairspace_russia": ("Russia (SafeAirspace)", "\U0001f1f7\U0001f1fa"),
+    "safeairspace_ukraine": ("Ukraine (SafeAirspace)", "\U0001f1fa\U0001f1e6"),
+    "safeairspace_iran": ("Iran (SafeAirspace)", "\U0001f1ee\U0001f1f7"),
+    "safeairspace_israel": ("Israel (SafeAirspace)", "\U0001f1ee\U0001f1f1"),
+    "safeairspace_iraq": ("Iraq (SafeAirspace)", "\U0001f1ee\U0001f1f6"),
+    "safeairspace_belarus": ("Belarus (SafeAirspace)", "\U0001f1e7\U0001f1fe"),
     "iranwarlive": ("Iran / Middle East (IranWarLive)", "\U0001f1ee\U0001f1f7"),
     "skyrestrict": ("Global No-Fly Zones (SkyRestrict)", "\U0001f6ab"),
+    "faa_nms": ("FAA NOTAM System", "\U0001f1fa\U0001f1f8"),
 }
 
 # SIGMET hazard code -> reason label (only VA is an actual airspace closure)
@@ -1238,6 +1250,106 @@ def scrape_skyrestrict() -> int:
     return saved
 
 
+def _scrape_safeairspace_country(slug: str, source: str, region: str) -> int:
+    """Scrape a SafeAirspace country detail page and store per-section advisories."""
+    url = f"https://safeairspace.net/{slug}/"
+    r = _cs_get(url)
+    print(f"SAFEAIRSPACE/{slug.upper()} status: {getattr(r, 'status_code', 'no response')}")
+    print(f"SAFEAIRSPACE/{slug.upper()} text: {getattr(r, 'text', '')[:500]}")
+    if r is None or r.status_code != 200:
+        logger.warning("safeairspace/%s: HTTP %s — skipping", slug, getattr(r, "status_code", "none"))
+        return 0
+
+    soup = BeautifulSoup(r.text, "html.parser")
+    page_text = soup.get_text(separator=" ", strip=True)
+    saved = 0
+
+    # Find all ICAO-style 4-letter codes mentioned on the page
+    found_firs = sorted({
+        m for m in re.findall(r"\b([A-Z]{4})\b", page_text.upper())
+        if m in FIR_READABLE
+    })
+    fir_summary = " | ".join(f"{f}: {FIR_READABLE[f]}" for f in found_firs[:8])
+    logger.info("safeairspace/%s: FIRs found: %s", slug, fir_summary or "none")
+
+    # Extract heading-delimited sections
+    sections: List[Tuple[str, str]] = []
+    for heading in soup.find_all(["h1", "h2", "h3", "h4"]):
+        title = heading.get_text(strip=True)
+        if len(title) < 4:
+            continue
+        body_parts: List[str] = []
+        for sib in heading.find_next_siblings():
+            if sib.name in ("h1", "h2", "h3", "h4"):
+                break
+            t = sib.get_text(separator=" ", strip=True)
+            if t:
+                body_parts.append(t)
+        body = " ".join(body_parts)[:600]
+        sections.append((title, body))
+
+    if sections:
+        for title, body in sections:
+            full_body = f"{body}\nFIRs: {fir_summary}".strip() if fir_summary else body
+            if save_scraper_item(source, region, region, title, full_body):
+                saved += 1
+    else:
+        # Fallback: store paragraph chunks
+        for el in soup.find_all(["p", "li"])[:30]:
+            text = el.get_text(strip=True)
+            if len(text) > 30:
+                body = f"{text}\nFIRs: {fir_summary}".strip() if fir_summary else text
+                if save_scraper_item(source, region, region, text[:80], body):
+                    saved += 1
+
+    print(f"Saved {saved} records from safeairspace/{slug}")
+    logger.info("safeairspace/%s: %d new item(s) saved", slug, saved)
+    return saved
+
+
+def scrape_faa_nms() -> int:
+    """Try the FAA NMS API (launched April 2026) for NOTAMs at key conflict locations."""
+    base_url = "https://nms.aim.faa.gov/api/v1/notams"
+    locations = ["UUWW", "UKBV", "OIIX", "LLLL", "ORBB", "UMMV"]
+    saved = 0
+    for loc in locations:
+        try:
+            r = requests.get(
+                base_url,
+                params={"location": loc},
+                headers={"User-Agent": "AirspaceBot/1.0", "Accept": "application/json"},
+                timeout=15,
+            )
+            print(f"FAA NMS {loc} status: {r.status_code}")
+            if r.status_code in (401, 403, 404, 429, 501, 502, 503):
+                logger.info("faa_nms: %s returned %d — skipping", loc, r.status_code)
+                continue
+            if r.status_code != 200:
+                continue
+            data = r.json()
+            items = data if isinstance(data, list) else (
+                data.get("items") or data.get("notams") or data.get("data") or []
+            )
+            for item in (items if isinstance(items, list) else [])[:20]:
+                if not isinstance(item, dict):
+                    continue
+                notam_id = str(item.get("notamNumber") or item.get("id") or "")
+                location = str(item.get("location") or loc)
+                text = str(item.get("text") or item.get("message") or item.get("body") or "")
+                if not text:
+                    continue
+                region = icao_to_region(location) or find_region(location)
+                fir_name = FIR_READABLE.get(location, location)
+                title = f"NOTAM {notam_id} — {fir_name}".strip(" —")
+                if save_scraper_item("faa_nms", location, region, title, text):
+                    saved += 1
+        except Exception as exc:
+            logger.info("faa_nms: %s error: %s", loc, exc)
+    print(f"Saved {saved} records from faa_nms")
+    logger.info("faa_nms: %d new item(s) saved", saved)
+    return saved
+
+
 async def run_scrapers(app: Application) -> None:
     """Run every web scraper sequentially and dispatch any new alerts."""
     logger.info("Scraper cycle started")
@@ -1245,6 +1357,17 @@ async def run_scrapers(app: Application) -> None:
     new_total += scrape_safeairspace()
     new_total += scrape_iranwarlive()
     new_total += scrape_skyrestrict()
+    # Country-specific SafeAirspace detail pages
+    for slug, source, region in [
+        ("russia",  "safeairspace_russia",  "Russia"),
+        ("ukraine", "safeairspace_ukraine", "Ukraine"),
+        ("iran",    "safeairspace_iran",    "Iran"),
+        ("israel",  "safeairspace_israel",  "Israel"),
+        ("iraq",    "safeairspace_iraq",    "Iraq"),
+        ("belarus", "safeairspace_belarus", "Belarus"),
+    ]:
+        new_total += _scrape_safeairspace_country(slug, source, region)
+    new_total += scrape_faa_nms()
     logger.info("Scraper cycle complete -- %d new entries", new_total)
     await dispatch_unalerted(app)
 
@@ -1450,9 +1573,18 @@ async def cmd_region(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
     for notam in notams[:5]:
         try:
-            await update.message.reply_text(
-                format_alert(notam), parse_mode=ParseMode.HTML
-            )
+            # Enrich scraped entries: surface any FIR codes mentioned in the text
+            msg = format_alert(notam)
+            raw = (notam["raw_text"] or notam["description"] or "")
+            fir_hits = [
+                f"<code>{f}</code> {he(FIR_READABLE[f])}"
+                for f in re.findall(r"\b([A-Z]{4})\b", raw.upper())
+                if f in FIR_READABLE
+            ]
+            if fir_hits:
+                fir_line = "\n\U0001f5fa <b>FIRs mentioned:</b> " + ", ".join(dict.fromkeys(fir_hits)[:5])
+                msg = msg + fir_line
+            await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
         except TelegramError as exc:
             logger.warning("Send failed: %s", exc)
 
@@ -1525,7 +1657,11 @@ async def cmd_active(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         "Unknown/restricted", "Restricted airspace",
         "Military/government airspace", "Unknown", "",
     }
-    _SCRAPER_SOURCES = {"safeairspace", "iranwarlive", "skyrestrict"}
+    _SCRAPER_SOURCES = {
+        "safeairspace", "safeairspace_russia", "safeairspace_ukraine",
+        "safeairspace_iran", "safeairspace_israel", "safeairspace_iraq",
+        "safeairspace_belarus", "iranwarlive", "skyrestrict", "faa_nms",
+    }
 
     # Separate volcanic-ash closures from scraped conflict-zone data
     va_notams = [n for n in notams if (n["source"] or "").lower() not in _SCRAPER_SOURCES]
