@@ -90,7 +90,7 @@ BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHANNEL_ID: str = os.getenv("TELEGRAM_CHANNEL_ID", "")
 DB_PATH: str = os.getenv("DB_PATH", "notams.db")
 POLL_INTERVAL: int = int(os.getenv("POLL_INTERVAL_MINUTES", "15"))
-SCRAPE_INTERVAL: int = int(os.getenv("SCRAPE_INTERVAL_MINUTES", "30"))
+SCRAPE_INTERVAL: int = int(os.getenv("SCRAPE_INTERVAL_MINUTES", "15"))
 
 AVIATIONWEATHER_API = "https://aviationweather.gov/api/data/isigmet?format=json"
 
@@ -1666,6 +1666,7 @@ async def cmd_map(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def _post_init(app: Application) -> None:
     scheduler = AsyncIOScheduler(timezone="UTC")
+    start_time = datetime.now(timezone.utc)
 
     scheduler.add_job(
         poll_and_alert,
@@ -1673,7 +1674,7 @@ async def _post_init(app: Application) -> None:
         minutes=POLL_INTERVAL,
         args=[app],
         id="sigmet_poll",
-        next_run_time=datetime.now(timezone.utc),
+        next_run_time=start_time,
         max_instances=1,
         coalesce=True,
     )
@@ -1681,10 +1682,10 @@ async def _post_init(app: Application) -> None:
     scheduler.add_job(
         run_scrapers,
         trigger="interval",
-        minutes=SCRAPE_INTERVAL,
+        minutes=POLL_INTERVAL,
         args=[app],
         id="web_scrapers",
-        next_run_time=datetime.now(timezone.utc),
+        next_run_time=start_time,
         max_instances=1,
         coalesce=True,
     )
@@ -1692,8 +1693,8 @@ async def _post_init(app: Application) -> None:
     scheduler.start()
     app.bot_data["scheduler"] = scheduler
     logger.info(
-        "Scheduler started -- SIGMETs every %d min, scrapers every %d min",
-        POLL_INTERVAL, SCRAPE_INTERVAL,
+        "Scheduler started -- all 4 sources refresh every %d min",
+        POLL_INTERVAL,
     )
 
 
