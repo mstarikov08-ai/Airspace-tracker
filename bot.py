@@ -1059,7 +1059,22 @@ _NEWS_QUERIES = [
     "airspace+restricted+Iran+Israel",
     "airspace+closed+Iraq+Syria",
     "NOTAM+military+airspace+closure",
+    "airspace+closed+Russia+2026",
+    "Russia+flight+ban+airspace",
+    "Russian+airspace+restriction+NOTAM",
 ]
+
+# Keywords that indicate a reopening — skip these entirely
+_REOPEN_WORDS = re.compile(
+    r"\b(reopen|reopens|lifts|lifted|restored|returns?\s+to\s+normal|back\s+to\s+normal|resume)\b",
+    re.IGNORECASE,
+)
+
+# At least one closure keyword must be present
+_CLOSURE_WORDS = re.compile(
+    r"\b(closed|closure|restricted|restriction|banned|prohibited|suspended|halted|NOTAM|no-fly|grounded|blocked)\b",
+    re.IGNORECASE,
+)
 
 _NEWS_COUNTRIES = [
     "Russia", "Ukraine", "Iran", "Israel", "Iraq",
@@ -1108,6 +1123,14 @@ def fetch_google_news_rss() -> int:
                 link = (item.findtext("link") or "").strip()
 
                 if not title:
+                    continue
+
+                # Skip reopening / normalisation news
+                if _REOPEN_WORDS.search(title):
+                    continue
+
+                # Must mention a closure-type keyword
+                if not _CLOSURE_WORDS.search(title):
                     continue
 
                 # Parse and filter by age
@@ -1449,7 +1472,7 @@ async def cmd_active(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     lines = [f"\U0001f30d <b>Active Airspace Closures</b> ({len(notams)} total)\n"]
 
-    # ── Section 1: SIGMET/API closures (volcanic ash etc.) ──────────────────
+    # ── Section 1: SIGMET/API closures (volcanic ash etc.) ──────────────────────
     if va_notams:
         by_group: Dict[str, list] = {}
         for n in va_notams:
@@ -1478,9 +1501,9 @@ async def cmd_active(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             lines.append(f"{sev_emoji} {flag} <b>{he(group)}</b>{loc_hint} — {len(items)} entry(ies)")
             lines.append(f"   └ {he(reason)}")
 
-    # ── Section 2: Google News recent closures ──────────────────────────────
+    # ── Section 2: Google News reports ─────────────────────────────────────────
     lines.append("")
-    lines.append("\U0001f4f0 <b>Recent Closures (Google News)</b>")
+    lines.append("\U0001f4f0 <b>\U0001f4f0 News Reports (Google News)</b>")
 
     if not conflict_notams:
         lines.append("   <i>No recent news items — check back in 15 minutes</i>")
@@ -1496,7 +1519,8 @@ async def cmd_active(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             country = (n["location"] or "").title()
             flag = REGIONS.get(n["region"] or "", {}).get("flag", "\U0001f4f0")
             lines.append(f"{flag} <b>{he(country)}</b> — {he(title[:100])}")
-            lines.append(f"   └ 🕐 {he(pub_label)}")
+            lines.append(f"   └ \U0001f550 {he(pub_label)}")
+            lines.append(f"   └ <i>⚠️ News report — verify before acting</i>")
 
     lines.append("\nUse <code>/region NAME</code> for details.")
 
